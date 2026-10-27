@@ -1,0 +1,323 @@
+openapi: 3.1.0
+info:
+  title: Aeitron Intelligent Global Edge & Cloud Infrastructure API
+  description: |
+    Unified, high-performance developer API for the Aeitron Cloud Platform.
+    Provides complete programmatic control over Edge Routing, Anycast DNS,
+    Sovereign Databases, Global Fleet Canary Orchestration, Billing, and Merkle Audit Ledgers.
+  version: 1.0.0
+  contact:
+    name: Aeitron Developer Support
+    url: https://aeitron.com
+    email: api-support@aeitron.com
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: https://api.aeitron.com
+    description: Production Global Anycast Gateway
+  - url: http://127.0.0.1:8000
+    description: Local Unified API Gateway
+
+security:
+  - ApiKeyAuth: []
+  - BearerAuth: []
+
+paths:
+  /ready:
+    get:
+      summary: Gateway Readiness Check
+      description: Returns 200 OK when the gateway and upstream proxies are operational.
+      security: []
+      responses:
+        '200':
+          description: Gateway is ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: healthy
+                  service:
+                    type: string
+                    example: aeitron-api-gateway
+                  time:
+                    type: string
+                    format: date-time
+
+  /live:
+    get:
+      summary: Gateway Liveness Check
+      description: Returns 200 OK when gateway process is running.
+      security: []
+      responses:
+        '200':
+          description: Process is alive
+
+  /v1/gateway/stats:
+    get:
+      summary: Retrieve Real-Time Gateway Statistics
+      description: Returns live telemetry, uptime, rate limited counts, and status code distributions.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Gateway statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayStats'
+
+  /v1/auth/token:
+    post:
+      summary: Issue or Refresh JWT Token
+      description: Authenticates credentials and returns a signed HMAC-SHA256 JWT access token.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [client_id, client_secret]
+              properties:
+                client_id:
+                  type: string
+                client_secret:
+                  type: string
+      responses:
+        '200':
+          description: Token issued successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /v1/databases/instances:
+    get:
+      summary: List Managed Database Instances
+      description: Retrieves all active database instances for the authenticated tenant.
+      responses:
+        '200':
+          description: List of database instances
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DatabaseInstance'
+    post:
+      summary: Provision a New Managed Database
+      description: Creates an automated PostgreSQL instance with PITR and continuous WAL streaming.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDatabaseRequest'
+      responses:
+        '201':
+          description: Database instance provisioned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseInstance'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+
+  /v1/fleet/nodes:
+    get:
+      summary: List Global Edge Nodes
+      description: Retrieves edge PoP inventory and canary rollout statuses.
+      responses:
+        '200':
+          description: List of global edge nodes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FleetNode'
+
+  /v1/fleet/canary/deploy:
+    post:
+      summary: Trigger Zero-Downtime Canary Rollout
+      description: Initiates a staged canary rollout across global PoPs with automated rollback on error-budget burn.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version, initial_percentage]
+              properties:
+                version:
+                  type: string
+                  example: v1.4.2
+                initial_percentage:
+                  type: integer
+                  example: 5
+      responses:
+        '202':
+          description: Canary rollout initiated
+
+  /v1/billing/invoices:
+    get:
+      summary: List Invoices
+      description: Retrieves billing invoices, usage breakdown, and payment receipts.
+      responses:
+        '200':
+          description: List of invoices
+
+  /v1/audit/records:
+    get:
+      summary: Query Merkle Audit Ledger
+      description: Queries tamper-proof cryptographic audit trail.
+      responses:
+        '200':
+          description: Cryptographic audit records
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Scoped API Key (e.g. aeitron_live_... or aeitron_test_...)
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    TokenResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          example: Bearer
+        expires_in:
+          type: integer
+          example: 3600
+
+    GatewayStats:
+      type: object
+      properties:
+        total_requests:
+          type: integer
+        active_upstreams:
+          type: integer
+        rate_limited_count:
+          type: integer
+        auth_failed_count:
+          type: integer
+        uptime_seconds:
+          type: integer
+
+    DatabaseInstance:
+      type: object
+      properties:
+        id:
+          type: string
+          example: db_inst_01
+        name:
+          type: string
+          example: production-postgres
+        engine:
+          type: string
+          example: postgresql-16
+        region:
+          type: string
+          example: eu-central-frankfurt
+        status:
+          type: string
+          example: running
+        pitr_enabled:
+          type: boolean
+          example: true
+
+    CreateDatabaseRequest:
+      type: object
+      required: [name, engine, region]
+      properties:
+        name:
+          type: string
+        engine:
+          type: string
+          enum: [postgresql-16, timescaledb]
+        region:
+          type: string
+        storage_gb:
+          type: integer
+          default: 20
+
+    FleetNode:
+      type: object
+      properties:
+        id:
+          type: string
+        pop_id:
+          type: string
+          example: fra-01
+        metro:
+          type: string
+          example: Frankfurt
+        health:
+          type: string
+          example: healthy
+        canary_weight:
+          type: integer
+          example: 100
+
+  responses:
+    UnauthorizedError:
+      description: Authentication failed or token missing/expired
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: "unauthorized: invalid token signature"
+
+    ForbiddenError:
+      description: Insufficient permission scopes
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: "forbidden: insufficient permission scopes"
+
+    RateLimitError:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema:
+            type: string
+          description: Seconds until retry is allowed
+        X-RateLimit-Limit:
+          schema:
+            type: string
+        X-RateLimit-Remaining:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: "rate limit exceeded for tenant: retry after 5s"
