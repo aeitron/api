@@ -90,6 +90,29 @@ func (cb *CircuitBreaker) State() string {
 	return cb.state
 }
 
+// StateCode returns numeric circuit status: 0=closed, 1=half-open, 2=open.
+func (cb *CircuitBreaker) StateCode() int {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	switch cb.state {
+	case "closed":
+		return 0
+	case "half-open":
+		return 1
+	case "open":
+		return 2
+	default:
+		return 0
+	}
+}
+
+// ConsecutiveFails returns consecutive failure count.
+func (cb *CircuitBreaker) ConsecutiveFails() int {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return cb.consecutiveFails
+}
+
 // UpstreamProxy encapsulates reverse proxying and circuit breaking for a specific upstream.
 type UpstreamProxy struct {
 	rule           RouteRule
@@ -199,4 +222,14 @@ func (up *UpstreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request, ctx *
 	r.Header.Set("X-Request-ID", reqID)
 
 	up.reverseProxy.ServeHTTP(w, r)
+}
+
+// UpstreamURL returns the configured upstream target URL string.
+func (up *UpstreamProxy) UpstreamURL() string {
+	return up.rule.UpstreamURL
+}
+
+// CircuitBreaker returns the proxy circuit breaker instance.
+func (up *UpstreamProxy) CircuitBreaker() *CircuitBreaker {
+	return up.circuitBreaker
 }

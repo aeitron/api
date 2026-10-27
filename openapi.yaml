@@ -58,6 +58,27 @@ paths:
         '200':
           description: Process is alive
 
+  /metrics:
+    get:
+      summary: Prometheus Operational Metrics
+      description: |
+        Exports live gateway operational metrics in standard OpenMetrics Prometheus text format (version 0.0.4).
+        Directly scrapable by Prometheus, VictoriaMetrics, and Grafana.
+        Includes request throughput (RPS), p50/p95/p99 latency histograms, in-flight requests,
+        RFC 9111 cache operations, rate limit drops, and upstream circuit breaker trip states.
+      security: []
+      responses:
+        '200':
+          description: Standard OpenMetrics Prometheus exposition text
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: |
+                  # HELP aeitron_api_requests_total Total number of HTTP requests processed by the API gateway
+                  # TYPE aeitron_api_requests_total counter
+                  aeitron_api_requests_total{method="GET",route="/v1/catalog",status="200"} 42
+
   /v1/gateway/stats:
     get:
       summary: Retrieve Real-Time Gateway Statistics

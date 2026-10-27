@@ -24,6 +24,7 @@ type APIGateway struct {
 	limiter       *TokenBucketLimiter
 	idempotency   *IdempotencyEngine
 	cache         *RFC9111CacheEngine
+	metrics       *MetricsCollector
 	auditSpooler  *AuditSpooler
 	stats         GatewayStats
 	startTime     time.Time
@@ -31,18 +32,20 @@ type APIGateway struct {
 
 // NewAPIGateway initializes an APIGateway with default core services.
 func NewAPIGateway(jwtSecret string) *APIGateway {
+	start := time.Now().UTC()
 	gw := &APIGateway{
 		proxies:       make(map[string]*UpstreamProxy),
 		authenticator: NewAuthenticator(jwtSecret),
 		limiter:       NewTokenBucketLimiter(),
 		idempotency:   NewIdempotencyEngine(24 * time.Hour),
 		cache:         NewRFC9111CacheEngine(10000, 64*1024*1024),
+		metrics:       NewMetricsCollector(start),
 		auditSpooler:  NewAuditSpooler(2000),
 		stats: GatewayStats{
 			StatusCodes:    make(map[int]int64),
 			UpstreamStatus: make(map[string]string),
 		},
-		startTime: time.Now().UTC(),
+		startTime: start,
 	}
 
 	// Register canonical Aeitron platform microservices and product family routes
@@ -113,6 +116,22 @@ func (gw *APIGateway) AuditSpooler() *AuditSpooler {
 	return gw.auditSpooler
 }
 
+// Metrics returns the gateway's Prometheus operational metrics collector.
+func (gw *APIGateway) Metrics() *MetricsCollector {
+	return gw.metrics
+}
+
+// Proxies returns a snapshot mapping of registered path prefixes to upstream proxies.
+func (gw *APIGateway) Proxies() map[string]*UpstreamProxy {
+	gw.mu.RLock()
+	defer gw.mu.RUnlock()
+	res := make(map[string]*UpstreamProxy, len(gw.proxies))
+	for k, v := range gw.proxies {
+		res[k] = v
+	}
+	return res
+}
+
 // RegisterRoute adds or updates a dynamic route rule.
 func (gw *APIGateway) RegisterRoute(rule RouteRule) error {
 	gw.mu.Lock()
@@ -163,10 +182,13 @@ func (gw *APIGateway) matchRoute(path string) (*RouteRule, *UpstreamProxy) {
 func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	atomic.AddInt64(&gw.stats.TotalRequests, 1)
+	gw.metrics.IncInFlight()
+	defer gw.metrics.DecInFlight()
 
 	// 1. Security Headers & CORS
 	ApplySecurityHeaders(w)
 	if HandleCORS(w, r) {
+		gw.metrics.RecordRequest(r.Method, "/cors", http.StatusNoContent, time.Since(start))
 		return
 	}
 
@@ -176,6 +198,16 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Built-in Gateway Endpoints & Documentation
 	if ServeDocs(w, r) {
+		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
+		return
+	}
+	if r.URL.Path == "/metrics" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write([]byte(gw.metrics.RenderPrometheus(gw.Proxies())))
+		}
+		gw.metrics.RecordRequest(r.Method, "/metrics", http.StatusOK, time.Since(start))
 		return
 	}
 	if r.URL.Path == "/healthz" || r.URL.Path == "/ready" {
@@ -184,6 +216,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"service": "aeitron-api-gateway",
 			"time":    time.Now().UTC().Format(time.RFC3339),
 		})
+		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
 		return
 	}
 	if r.URL.Path == "/v1/gateway/routes" {
@@ -192,6 +225,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		copy(routes, gw.routes)
 		gw.mu.RUnlock()
 		writeJSONResponse(w, http.StatusOK, map[string]interface{}{"routes": routes})
+		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
 		return
 	}
 	if r.URL.Path == "/v1/gateway/stats" {
@@ -200,6 +234,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		st.UptimeSeconds = int64(time.Since(gw.startTime).Seconds())
 		gw.mu.RUnlock()
 		writeJSONResponse(w, http.StatusOK, st)
+		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
 		return
 	}
 	if (r.URL.Path == "/v1/gateway/cache/purge" || r.URL.Path == "/v1/gateway/cache") && (r.Method == http.MethodPost || r.Method == http.MethodDelete) {
@@ -214,11 +249,13 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else if purgeReq.Prefix != "" {
 			evicted = gw.cache.InvalidatePrefix(purgeReq.Prefix)
 		}
+		gw.metrics.RecordCacheOp("PURGE")
 		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
 			"status":        "purged",
 			"evicted_count": evicted,
 			"remaining":     gw.cache.Size(),
 		})
+		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
 		return
 	}
 
@@ -257,6 +294,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 							"tenant_id":    tenantCtx.TenantID,
 							"tier":         tenantCtx.Tier,
 						})
+						gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
 						return
 					}
 				}
@@ -272,6 +310,8 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	allowed, remaining, retryAfter := gw.limiter.Allow("ip:"+clientIP, ipTier.RequestsPerSecond, ipTier.BurstCapacity)
 	if !allowed {
 		atomic.AddInt64(&gw.stats.RateLimitedCount, 1)
+		gw.metrics.RecordRateLimit("ip")
+		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusTooManyRequests, time.Since(start))
 		WriteRateLimited(w, r, "too many requests from this IP: rate limit exceeded", int(retryAfter.Seconds()))
 		return
 	}
@@ -279,6 +319,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 6. Route Resolution
 	rule, proxy := gw.matchRoute(r.URL.Path)
 	if rule == nil || proxy == nil {
+		gw.metrics.RecordRequest(r.Method, "/unmatched", http.StatusNotFound, time.Since(start))
 		WriteNotFound(w, r, "route not found on api-gateway")
 		return
 	}
@@ -304,12 +345,14 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx, err := gw.authenticator.AuthenticateRequest(r)
 		if err != nil {
 			atomic.AddInt64(&gw.stats.AuthFailedCount, 1)
+			gw.metrics.RecordRequest(r.Method, rule.PathPrefix, http.StatusUnauthorized, time.Since(start))
 			WriteUnauthorized(w, r, fmt.Sprintf("unauthorized: %s", err.Error()))
 			return
 		}
 
 		// Check permission scopes
 		if !CheckScopes(ctx.Scopes, rule.RequiredScopes) {
+			gw.metrics.RecordRequest(r.Method, rule.PathPrefix, http.StatusForbidden, time.Since(start))
 			WriteForbidden(w, r, "forbidden: insufficient permission scopes")
 			return
 		}
@@ -332,6 +375,8 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if !tAllowed {
 			atomic.AddInt64(&gw.stats.RateLimitedCount, 1)
+			gw.metrics.RecordRateLimit(tierName)
+			gw.metrics.RecordRequest(r.Method, rule.PathPrefix, http.StatusTooManyRequests, time.Since(start))
 			WriteRateLimited(w, r, fmt.Sprintf("rate limit exceeded for tenant '%s' on '%s' tier", ctx.TenantID, tierName), int(tRetry.Seconds()))
 			return
 		}
@@ -356,6 +401,8 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if idempKey != "" {
 		if err := ValidateIdempotencyKey(idempKey); err != nil {
+			gw.metrics.RecordIdempotencyOp("INVALID")
+			gw.metrics.RecordRequest(r.Method, rule.PathPrefix, http.StatusBadRequest, time.Since(start))
 			WriteBadRequest(w, r, fmt.Sprintf("invalid idempotency key: %s", err.Error()), "INVALID_IDEMPOTENCY_KEY")
 			return
 		}
@@ -369,6 +416,8 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var readErr error
 		bodyBytes, readErr = io.ReadAll(r.Body)
 		if readErr != nil {
+			gw.metrics.RecordIdempotencyOp("READ_ERROR")
+			gw.metrics.RecordRequest(r.Method, rule.PathPrefix, http.StatusBadRequest, time.Since(start))
 			WriteBadRequest(w, r, "unable to read request body for idempotency validation", "INVALID_REQUEST_BODY")
 			return
 		}
@@ -377,14 +426,20 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rec, isReplay, acqErr := gw.idempotency.AcquireOrReplay(scopeTenant, idempKey, r.Method, r.URL.Path, bodyBytes, 2*time.Second)
 		if acqErr != nil {
 			if errors.Is(acqErr, ErrIdempotencyMismatch) {
+				gw.metrics.RecordIdempotencyOp("CONFLICT")
+				gw.metrics.RecordRequest(r.Method, rule.PathPrefix, http.StatusConflict, time.Since(start))
 				WriteConflict(w, r, "keys with identical idempotency values must send identical request parameters", "IDEMPOTENCY_KEY_MISMATCH")
 				return
 			}
 			if errors.Is(acqErr, ErrIdempotencyInFlight) {
+				gw.metrics.RecordIdempotencyOp("IN_FLIGHT")
+				gw.metrics.RecordRequest(r.Method, rule.PathPrefix, http.StatusConflict, time.Since(start))
 				w.Header().Set("Retry-After", "1")
 				WriteConflict(w, r, "a request with this idempotency key is currently in progress", "IDEMPOTENCY_KEY_IN_FLIGHT")
 				return
 			}
+			gw.metrics.RecordIdempotencyOp("ERROR")
+			gw.metrics.RecordRequest(r.Method, rule.PathPrefix, http.StatusBadRequest, time.Since(start))
 			WriteBadRequest(w, r, acqErr.Error(), "IDEMPOTENCY_ERROR")
 			return
 		}
@@ -401,6 +456,9 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			gw.mu.Lock()
 			gw.stats.StatusCodes[rec.StatusCode]++
 			gw.mu.Unlock()
+
+			gw.metrics.RecordIdempotencyOp("REPLAYED")
+			gw.metrics.RecordRequest(r.Method, rule.PathPrefix, rec.StatusCode, time.Since(start))
 			return
 		}
 
@@ -440,6 +498,9 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					gw.mu.Lock()
 					gw.stats.StatusCodes[http.StatusNotModified]++
 					gw.mu.Unlock()
+
+					gw.metrics.RecordCacheOp("304_NOT_MODIFIED")
+					gw.metrics.RecordRequest(r.Method, rule.PathPrefix, http.StatusNotModified, time.Since(start))
 					return
 				}
 
@@ -462,6 +523,9 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				gw.mu.Lock()
 				gw.stats.StatusCodes[entry.StatusCode]++
 				gw.mu.Unlock()
+
+				gw.metrics.RecordCacheOp("HIT")
+				gw.metrics.RecordRequest(r.Method, rule.PathPrefix, entry.StatusCode, time.Since(start))
 				return
 			}
 		}
@@ -474,6 +538,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if isCacheEligible {
 		w.Header().Set("X-Cache", "MISS")
+		gw.metrics.RecordCacheOp("MISS")
 	}
 	proxy.ServeHTTP(wrapper, r, tenantCtx, reqID)
 
@@ -485,6 +550,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ttl := gw.cache.ParseUpstreamTTL(wrapper.Header(), rule.CacheTTL)
 			if ttl > 0 {
 				gw.cache.Store(cacheKey, r.URL.Path, wrapper.StatusCode, wrapper.Header(), wrapper.BodyBuffer.Bytes(), ttl)
+				gw.metrics.RecordCacheOp("STORE")
 			}
 		}
 	}
@@ -501,13 +567,17 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if isIdempReq {
 		if wrapper.StatusCode < 500 {
 			gw.idempotency.Complete(scopeTenant, idempKey, wrapper.StatusCode, wrapper.Header(), wrapper.BodyBuffer.Bytes())
+			gw.metrics.RecordIdempotencyOp("NEW")
 		} else {
 			// Server faults (5xx) do not lock or cache, allowing safe retry
 			gw.idempotency.Abort(scopeTenant, idempKey)
+			gw.metrics.RecordIdempotencyOp("ABORTED")
 		}
 	}
 
-	// 13. Record Stats
+	// 13. Record Metrics and Stats
+	gw.metrics.RecordRequest(r.Method, rule.PathPrefix, wrapper.StatusCode, duration)
+
 	gw.mu.Lock()
 	gw.stats.StatusCodes[wrapper.StatusCode]++
 	gw.mu.Unlock()

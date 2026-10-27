@@ -1230,6 +1230,197 @@ func TestAPIGateway_RFC9111_CachePurgeEndpoint(t *testing.T) {
 	}
 }
 
+func TestAPIGateway_PrometheusMetrics_Endpoint(t *testing.T) {
+	gw := NewAPIGateway("test-secret-key-32-bytes-long-aeitron")
+
+	// 1. GET /metrics
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /metrics, got %d", rec.Code)
+	}
+	ct := rec.Header().Get("Content-Type")
+	if !strings.Contains(ct, "text/plain") || !strings.Contains(ct, "version=0.0.4") {
+		t.Fatalf("expected OpenMetrics content type, got: %s", ct)
+	}
+
+	body := rec.Body.String()
+
+	// Verify standard Prometheus headers and gauges
+	expectedTokens := []string{
+		"# HELP aeitron_api_requests_total",
+		"# TYPE aeitron_api_requests_total counter",
+		"# HELP aeitron_api_request_duration_seconds",
+		"# TYPE aeitron_api_request_duration_seconds histogram",
+		"# HELP aeitron_api_in_flight_requests",
+		"# TYPE aeitron_api_in_flight_requests gauge",
+		"# HELP aeitron_api_uptime_seconds",
+		"# TYPE aeitron_api_uptime_seconds gauge",
+		"# HELP aeitron_api_goroutines",
+		"# TYPE aeitron_api_goroutines gauge",
+		"# HELP aeitron_api_memory_alloc_bytes",
+		"# TYPE aeitron_api_memory_alloc_bytes gauge",
+		"aeitron_api_in_flight_requests",
+		"aeitron_api_uptime_seconds",
+		"aeitron_api_goroutines",
+	}
+
+	for _, token := range expectedTokens {
+		if !strings.Contains(body, token) {
+			t.Fatalf("metrics output missing expected token %q:\n%s", token, body)
+		}
+	}
+
+	// 2. HEAD /metrics
+	headReq := httptest.NewRequest(http.MethodHead, "/metrics", nil)
+	headRec := httptest.NewRecorder()
+	gw.ServeHTTP(headRec, headReq)
+
+	if headRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for HEAD /metrics, got %d", headRec.Code)
+	}
+	if headRec.Body.Len() != 0 {
+		t.Fatalf("expected empty body for HEAD /metrics, got %d bytes", headRec.Body.Len())
+	}
+}
+
+func TestAPIGateway_PrometheusMetrics_CountersAndHistograms(t *testing.T) {
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer mockUpstream.Close()
+
+	gw := NewAPIGateway("test-secret-key-32-bytes-long-aeitron")
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/catalog",
+		UpstreamURL:    mockUpstream.URL,
+		AllowAnonymous: true,
+	})
+
+	// Make 3 requests
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/v1/catalog/items", nil)
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+	}
+
+	// Fetch /metrics
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	metricsOutput := rec.Body.String()
+
+	// Verify request counter for /v1/catalog route
+	expectedReqTotal := `aeitron_api_requests_total{method="GET",route="/v1/catalog",status="200"} 3`
+	if !strings.Contains(metricsOutput, expectedReqTotal) {
+		t.Fatalf("missing expected request total counter:\nExpected: %s\nGot:\n%s", expectedReqTotal, metricsOutput)
+	}
+
+	// Verify histogram bucket counters
+	if !strings.Contains(metricsOutput, `aeitron_api_request_duration_seconds_bucket{route="/v1/catalog",le="+Inf"} 3`) {
+		t.Fatalf("missing +Inf histogram bucket in metrics:\n%s", metricsOutput)
+	}
+	if !strings.Contains(metricsOutput, `aeitron_api_request_duration_seconds_count{route="/v1/catalog"} 3`) {
+		t.Fatalf("missing histogram count in metrics:\n%s", metricsOutput)
+	}
+	if !strings.Contains(metricsOutput, `aeitron_api_request_duration_seconds_sum{route="/v1/catalog"}`) {
+		t.Fatalf("missing histogram sum in metrics:\n%s", metricsOutput)
+	}
+}
+
+func TestAPIGateway_PrometheusMetrics_RateLimitAndCacheTelemetry(t *testing.T) {
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `W/"item_etag_123"`)
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"item":"test"}`))
+	}))
+	defer mockUpstream.Close()
+
+	gw := NewAPIGateway("test-secret-key-32-bytes-long-aeitron")
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/catalog",
+		UpstreamURL:    mockUpstream.URL,
+		AllowAnonymous: true,
+		CacheTTL:       60 * time.Second,
+	})
+
+	// 1. Initial request (Cache MISS & STORE)
+	req := httptest.NewRequest(http.MethodGet, "/v1/catalog/item/1", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+
+	// 2. Second request (Cache HIT 200)
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/catalog/item/1", nil)
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK || rec2.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("expected cache HIT, got %s", rec2.Header().Get("X-Cache"))
+	}
+
+	// 3. Third request conditional (Cache HIT 304 Not Modified)
+	req3 := httptest.NewRequest(http.MethodGet, "/v1/catalog/item/1", nil)
+	req3.Header.Set("If-None-Match", `W/"item_etag_123"`)
+	rec3 := httptest.NewRecorder()
+	gw.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusNotModified {
+		t.Fatalf("expected 304 Not Modified, got %d", rec3.Code)
+	}
+
+	// 4. Trigger rate limit explicitly on gateway limiter
+	gw.Metrics().RecordRateLimit("free")
+
+	// 5. Trigger idempotency replay explicitly
+	gw.Metrics().RecordIdempotencyOp("REPLAYED")
+
+	// Scrape /metrics
+	mReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	mRec := httptest.NewRecorder()
+	gw.ServeHTTP(mRec, mReq)
+	out := mRec.Body.String()
+
+	// Verify Cache Telemetry
+	if !strings.Contains(out, `aeitron_api_cache_operations_total{status="HIT"} 1`) {
+		t.Fatalf("missing cache HIT counter in metrics:\n%s", out)
+	}
+	if !strings.Contains(out, `aeitron_api_cache_operations_total{status="304_NOT_MODIFIED"} 1`) {
+		t.Fatalf("missing cache 304 counter in metrics:\n%s", out)
+	}
+	if !strings.Contains(out, `aeitron_api_cache_operations_total{status="MISS"} 1`) {
+		t.Fatalf("missing cache MISS counter in metrics:\n%s", out)
+	}
+	if !strings.Contains(out, `aeitron_api_cache_operations_total{status="STORE"} 1`) {
+		t.Fatalf("missing cache STORE counter in metrics:\n%s", out)
+	}
+
+	// Verify Rate Limiting Telemetry
+	if !strings.Contains(out, `aeitron_api_rate_limited_total{tier="free"} 1`) {
+		t.Fatalf("missing rate limited counter in metrics:\n%s", out)
+	}
+
+	// Verify Idempotency Telemetry
+	if !strings.Contains(out, `aeitron_api_idempotency_operations_total{status="REPLAYED"} 1`) {
+		t.Fatalf("missing idempotency replay counter in metrics:\n%s", out)
+	}
+
+	// Verify Circuit Breaker Telemetry for registered upstream
+	if !strings.Contains(out, `aeitron_api_circuit_breaker_state{route="/v1/catalog"`) {
+		t.Fatalf("missing circuit breaker state in metrics:\n%s", out)
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
