@@ -232,6 +232,86 @@ paths:
         '200':
           description: Real-time tenant usage snapshot
 
+  /v1/notifications/dispatch:
+    post:
+      summary: Broadcast System or User Event
+      description: Routes an event to all subscribed multi-channel destinations (Signed Webhooks, Email, SMS, Slack, Discord, PagerDuty).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant_id, type, severity, title, message]
+              properties:
+                tenant_id:
+                  type: string
+                type:
+                  type: string
+                  example: io.aeitron.fleet.canary.rollback.v1
+                severity:
+                  type: string
+                  enum: [info, warning, error, critical]
+                title:
+                  type: string
+                message:
+                  type: string
+      responses:
+        '202':
+          description: Notification event accepted and queued for multi-channel broadcast
+
+  /v1/notifications/subscriptions:
+    post:
+      summary: Create Alert Channel Subscription
+      description: Configures a destination (Webhook, Email, SMS, Slack, Discord, PagerDuty) for a tenant.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant_id, channel, target]
+              properties:
+                tenant_id:
+                  type: string
+                channel:
+                  type: string
+                  enum: [webhook, email, sms, slack, discord, pagerduty]
+                target:
+                  type: string
+                secret:
+                  type: string
+                min_severity:
+                  type: string
+                  enum: [info, warning, error, critical]
+      responses:
+        '201':
+          description: Subscription created successfully
+    get:
+      summary: List Active Alert Subscriptions
+      parameters:
+        - name: tenant_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Active subscriptions for tenant
+
+  /v1/notifications/dlq:
+    get:
+      summary: List Dead-Letter Queue (DLQ) Records
+      description: Returns failed webhook deliveries stored in the DLQ for review and replay.
+      parameters:
+        - name: tenant_id
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Dead-letter queue records
+
 components:
   securitySchemes:
     ApiKeyAuth:
