@@ -616,3 +616,66 @@ func TestAPIGateway_DefaultProductRoutes(t *testing.T) {
 		}
 	}
 }
+
+func TestAPIGateway_InteractiveDocsEndpoints(t *testing.T) {
+	gw := NewAPIGateway("test-secret-32-bytes-docs-suite")
+
+	// 1. /docs endpoint (Scalar UI)
+	req := httptest.NewRequest(http.MethodGet, "/docs", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /docs, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Header().Get("Content-Type"), "text/html") {
+		t.Errorf("expected text/html for /docs, got %s", rec.Header().Get("Content-Type"))
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "@scalar/api-reference") || !strings.Contains(body, "Aeitron Global Infrastructure") {
+		t.Errorf("expected Scalar documentation HTML content, got: %s", body[:min(len(body), 200)])
+	}
+
+	// 2. /scalar alias with trailing slash
+	req = httptest.NewRequest(http.MethodGet, "/scalar/", nil)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /scalar/, got %d", rec.Code)
+	}
+
+	// 3. /swagger endpoint (Swagger UI)
+	req = httptest.NewRequest(http.MethodGet, "/swagger", nil)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /swagger, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "swagger-ui-bundle.js") {
+		t.Errorf("expected Swagger UI bundle script in response")
+	}
+
+	// 4. /openapi.yaml raw spec endpoint
+	req = httptest.NewRequest(http.MethodGet, "/openapi.yaml", nil)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /openapi.yaml, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Header().Get("Content-Type"), "text/yaml") {
+		t.Errorf("expected text/yaml for /openapi.yaml, got %s", rec.Header().Get("Content-Type"))
+	}
+	yamlContent := rec.Body.String()
+	if !strings.Contains(yamlContent, "openapi: 3.1.0") || !strings.Contains(yamlContent, "Aeitron Intelligent Global Edge") {
+		t.Errorf("expected OpenAPI 3.1.0 YAML content in response")
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

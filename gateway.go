@@ -158,7 +158,10 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reqID := ExtractOrGenerateRequestID(r)
 	w.Header().Set("X-Request-ID", reqID)
 
-	// 3. Built-in Gateway Endpoints
+	// 3. Built-in Gateway Endpoints & Documentation
+	if ServeDocs(w, r) {
+		return
+	}
 	if r.URL.Path == "/healthz" || r.URL.Path == "/ready" {
 		writeJSONResponse(w, http.StatusOK, map[string]string{
 			"status":  "healthy",
