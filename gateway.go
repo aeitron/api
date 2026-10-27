@@ -1,8 +1,10 @@
 package apigateway
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sort"
@@ -38,19 +40,44 @@ func NewAPIGateway(jwtSecret string) *APIGateway {
 		startTime: time.Now().UTC(),
 	}
 
-	// Register canonical Aeitron platform microservices
+	// Register canonical Aeitron platform microservices and product family routes
 	defaultRoutes := []RouteRule{
+		// Identity, Authentication, and Multi-Tenant RBAC
 		{PathPrefix: "/v1/auth", UpstreamURL: "http://127.0.0.1:9092", AllowAnonymous: true, Timeout: 10 * time.Second},
 		{PathPrefix: "/v1/identity", UpstreamURL: "http://127.0.0.1:9092", AllowAnonymous: false, Timeout: 10 * time.Second},
 		{PathPrefix: "/v1/organizations", UpstreamURL: "http://127.0.0.1:9093", AllowAnonymous: false, Timeout: 10 * time.Second},
 		{PathPrefix: "/v1/audit", UpstreamURL: "http://127.0.0.1:9094", AllowAnonymous: false, RequiredScopes: []string{"audit:read"}, Timeout: 15 * time.Second},
+
+		// Sovereign Databases and Automated Backups
 		{PathPrefix: "/v1/databases", UpstreamURL: "http://127.0.0.1:9095", AllowAnonymous: false, Timeout: 30 * time.Second},
+		{PathPrefix: "/v1/backups", UpstreamURL: "http://127.0.0.1:9097", AllowAnonymous: false, Timeout: 30 * time.Second},
+
+		// Global Fleet Canary Orchestration
 		{PathPrefix: "/v1/fleet", UpstreamURL: "http://127.0.0.1:9096", AllowAnonymous: false, RequiredScopes: []string{"fleet:read"}, Timeout: 15 * time.Second},
+
+		// Real-time Metering, Telemetry, and Multi-channel Notifications
+		{PathPrefix: "/v1/usage", UpstreamURL: "http://127.0.0.1:8099", AllowAnonymous: false, Timeout: 10 * time.Second},
+		{PathPrefix: "/v1/notifications", UpstreamURL: "http://127.0.0.1:8100", AllowAnonymous: false, Timeout: 10 * time.Second},
+
+		// Financial Ledger, Invoicing, and Sovereign Billing
 		{PathPrefix: "/v1/billing", UpstreamURL: "http://127.0.0.1:8097", AllowAnonymous: false, Timeout: 15 * time.Second},
 		{PathPrefix: "/v1/commerce", UpstreamURL: "http://127.0.0.1:8098", AllowAnonymous: true, Timeout: 15 * time.Second},
+
+		// Canonical Product Domains (Route directly with URL rewriting to commerce backend)
+		{PathPrefix: "/v1/catalog", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/catalog", AllowAnonymous: true, Timeout: 10 * time.Second},
+		{PathPrefix: "/v1/orders", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/orders", AllowAnonymous: false, Timeout: 20 * time.Second},
+		{PathPrefix: "/v1/domains", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/domains", AllowAnonymous: true, Timeout: 20 * time.Second},
+		{PathPrefix: "/v1/hosting", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/hosting", AllowAnonymous: false, Timeout: 30 * time.Second},
+		{PathPrefix: "/v1/compute", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/compute", AllowAnonymous: false, Timeout: 30 * time.Second},
+		{PathPrefix: "/v1/subscriptions", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/subscriptions", AllowAnonymous: false, Timeout: 15 * time.Second},
+		{PathPrefix: "/v1/invoices", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/invoices", AllowAnonymous: false, Timeout: 15 * time.Second},
+		{PathPrefix: "/v1/emails", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/emails", AllowAnonymous: false, Timeout: 15 * time.Second},
+
+		// Authoritative Anycast DNS, Global Traffic Director, Edge WAF, and Security
 		{PathPrefix: "/v1/dns", UpstreamURL: "http://127.0.0.1:8053", AllowAnonymous: false, Timeout: 10 * time.Second},
 		{PathPrefix: "/v1/router", UpstreamURL: "http://127.0.0.1:9090", AllowAnonymous: false, Timeout: 10 * time.Second},
 		{PathPrefix: "/v1/edge", UpstreamURL: "http://127.0.0.1:9091", AllowAnonymous: false, Timeout: 15 * time.Second},
+		{PathPrefix: "/v1/security", UpstreamURL: "http://127.0.0.1:8054", AllowAnonymous: false, Timeout: 10 * time.Second},
 	}
 
 	for _, r := range defaultRoutes {
@@ -157,29 +184,75 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. IP-Level Token Bucket Rate Limiting
+	// 4. Built-in Local Fast Token Issuance (/v1/auth/token)
+	if r.URL.Path == "/v1/auth/token" && r.Method == http.MethodPost {
+		var tokenReq struct {
+			ClientID     string `json:"client_id"`
+			ClientSecret string `json:"client_secret"`
+			APIKey       string `json:"api_key"`
+		}
+		bodyBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 65536))
+		if err == nil {
+			_ = json.Unmarshal(bodyBytes, &tokenReq)
+			candidateKey := strings.TrimSpace(tokenReq.APIKey)
+			if candidateKey == "" {
+				candidateKey = strings.TrimSpace(tokenReq.ClientID)
+			}
+			if candidateKey != "" {
+				tenantCtx, vErr := gw.authenticator.validateAPIKey(candidateKey)
+				if vErr == nil {
+					token, tErr := gw.authenticator.GenerateSignedToken(JWTClaims{
+						Sub:       tenantCtx.ActorID,
+						TenantID:  tenantCtx.TenantID,
+						OrgID:     tenantCtx.OrgID,
+						ProjectID: tenantCtx.ProjectID,
+						Role:      tenantCtx.Role,
+						Scopes:    tenantCtx.Scopes,
+						Tier:      tenantCtx.Tier,
+						Exp:       time.Now().Add(1 * time.Hour).Unix(),
+					})
+					if tErr == nil {
+						writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+							"access_token": token,
+							"token_type":   "Bearer",
+							"expires_in":   3600,
+							"tenant_id":    tenantCtx.TenantID,
+							"tier":         tenantCtx.Tier,
+						})
+						return
+					}
+				}
+			}
+			// Reset body for upstream proxying if not handled locally
+			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		}
+	}
+
+	// 5. IP-Level Token Bucket Rate Limiting
 	clientIP := extractClientIP(r)
 	ipTier := DefaultRateLimits["ip_default"]
 	allowed, remaining, retryAfter := gw.limiter.Allow("ip:"+clientIP, ipTier.RequestsPerSecond, ipTier.BurstCapacity)
 	if !allowed {
 		atomic.AddInt64(&gw.stats.RateLimitedCount, 1)
-		w.Header().Set("Retry-After", fmt.Sprintf("%.0f", retryAfter.Seconds()))
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"error":"too many requests from this IP: rate limit exceeded"}`))
+		WriteRateLimited(w, r, "too many requests from this IP: rate limit exceeded", int(retryAfter.Seconds()))
 		return
 	}
 
-	// 5. Route Resolution
+	// 6. Route Resolution
 	rule, proxy := gw.matchRoute(r.URL.Path)
 	if rule == nil || proxy == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"error":"route not found on api-gateway"}`))
+		WriteNotFound(w, r, "route not found on api-gateway")
 		return
 	}
 
-	// 6. Strip Client Identity Headers (Prevent Tenant Spoofing)
+	// Enforce Body Size Limiting
+	maxBody := int64(10 * 1024 * 1024) // 10MB default
+	if rule.MaxBodyBytes > 0 {
+		maxBody = rule.MaxBodyBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+
+	// 7. Strip Client Identity Headers (Prevent Tenant Spoofing)
 	r.Header.Del("X-Tenant-ID")
 	r.Header.Del("X-Org-ID")
 	r.Header.Del("X-Project-ID")
@@ -188,28 +261,24 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var tenantCtx *TenantContext
 
-	// 7. Authentication & Authorization
+	// 8. Authentication & Authorization
 	if !rule.AllowAnonymous {
 		ctx, err := gw.authenticator.AuthenticateRequest(r)
 		if err != nil {
 			atomic.AddInt64(&gw.stats.AuthFailedCount, 1)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = fmt.Fprintf(w, `{"error":"unauthorized: %s"}`, err.Error())
+			WriteUnauthorized(w, r, fmt.Sprintf("unauthorized: %s", err.Error()))
 			return
 		}
 
 		// Check permission scopes
 		if !CheckScopes(ctx.Scopes, rule.RequiredScopes) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte(`{"error":"forbidden: insufficient permission scopes"}`))
+			WriteForbidden(w, r, "forbidden: insufficient permission scopes")
 			return
 		}
 
 		tenantCtx = ctx
 
-		// 8. Tenant-Level Rate Limiting
+		// 9. Tenant-Level Rate Limiting
 		tierName := ctx.Tier
 		if tierName == "" {
 			tierName = "free"
@@ -225,10 +294,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if !tAllowed {
 			atomic.AddInt64(&gw.stats.RateLimitedCount, 1)
-			w.Header().Set("Retry-After", fmt.Sprintf("%.0f", tRetry.Seconds()))
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = fmt.Fprintf(w, `{"error":"rate limit exceeded for tenant '%s' on '%s' tier"}`, ctx.TenantID, tierName)
+			WriteRateLimited(w, r, fmt.Sprintf("rate limit exceeded for tenant '%s' on '%s' tier", ctx.TenantID, tierName), int(tRetry.Seconds()))
 			return
 		}
 	} else {

@@ -4,7 +4,8 @@ info:
   description: |
     Unified, high-performance developer API for the Aeitron Cloud Platform.
     Provides complete programmatic control over Edge Routing, Anycast DNS,
-    Sovereign Databases, Global Fleet Canary Orchestration, Billing, and Merkle Audit Ledgers.
+    Sovereign Databases, Compute/VPS/GPU, Web Hosting, Domain Registration,
+    Server-Authoritative Pricing, Real-time Metering, and Merkle Audit Ledgers.
   version: 1.0.0
   contact:
     name: Aeitron Developer Support
@@ -51,7 +52,7 @@ paths:
   /live:
     get:
       summary: Gateway Liveness Check
-      description: Returns 200 OK when gateway process is running.
+      description: Returns 200 OK when the gateway process is running.
       security: []
       responses:
         '200':
@@ -61,9 +62,6 @@ paths:
     get:
       summary: Retrieve Real-Time Gateway Statistics
       description: Returns live telemetry, uptime, rate limited counts, and status code distributions.
-      security:
-        - BearerAuth: []
-        - ApiKeyAuth: []
       responses:
         '200':
           description: Gateway statistics
@@ -72,10 +70,27 @@ paths:
               schema:
                 $ref: '#/components/schemas/GatewayStats'
 
+  /v1/gateway/routes:
+    get:
+      summary: List Registered Routing Rules
+      description: Returns the active reverse proxy table, timeout configurations, and upstream endpoints.
+      responses:
+        '200':
+          description: Active route table
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  routes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RouteRule'
+
   /v1/auth/token:
     post:
-      summary: Issue or Refresh JWT Token
-      description: Authenticates credentials and returns a signed HMAC-SHA256 JWT access token.
+      summary: Fast API-Key Token Exchange or JWT Issuance
+      description: Authenticates credentials or exchanges an API key for a signed HMAC-SHA256 JWT access token.
       security: []
       requestBody:
         required: true
@@ -83,8 +98,10 @@ paths:
           application/json:
             schema:
               type: object
-              required: [client_id, client_secret]
               properties:
+                api_key:
+                  type: string
+                  example: aeitron_live_secret_key_...
                 client_id:
                   type: string
                 client_secret:
@@ -99,10 +116,341 @@ paths:
         '401':
           $ref: '#/components/responses/UnauthorizedError'
 
+  /v1/catalog:
+    get:
+      summary: List Product Catalog & Base Pricing
+      description: Returns all active platform products (Compute, Domains, Hosting, Storage, Databases) with server-authoritative rates.
+      security: []
+      parameters:
+        - name: type
+          in: query
+          schema:
+            type: string
+            enum: [domain, hosting, vps, database, storage]
+      responses:
+        '200':
+          description: Product catalog listing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  products:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Product'
+
+  /v1/catalog/calculate:
+    post:
+      summary: Calculate Server-Authoritative Quote
+      description: Computes exact monetary quote with tax and volume discounts. Client prices are never trusted.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  items:
+                    type: object
+                    required: [priceId, quantity]
+                    properties:
+                      priceId:
+                        type: string
+                      quantity:
+                        type: integer
+                        minimum: 1
+                currency:
+                  type: string
+                  enum: [USD, BDT]
+                  default: USD
+                discountCode:
+                  type: string
+      responses:
+        '200':
+          description: Calculated quote
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuoteCalculation'
+
+  /v1/orders:
+    post:
+      summary: Create Order (Server-Authoritative Checkout)
+      description: Places an order against server-verified prices. Triggers transactional outbox provisioning workflow.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  items:
+                    type: object
+                    required: [priceId, quantity]
+                    properties:
+                      priceId:
+                        type: string
+                      quantity:
+                        type: integer
+                currency:
+                  type: string
+                  enum: [USD, BDT]
+                idempotencyKey:
+                  type: string
+      responses:
+        '201':
+          description: Order created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+
+  /v1/orders/{order_id}:
+    get:
+      summary: Get Order Status and Provisioning Lifecycle
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Order details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+
+  /v1/invoices:
+    get:
+      summary: List Invoices & Tax Receipts
+      description: Retrieves tenant invoices with Mushak 6.3 VAT compliance details.
+      responses:
+        '200':
+          description: List of invoices
+
+  /v1/domains/search:
+    get:
+      summary: Multi-TLD Domain Search & Suggestions
+      description: Queries RDAP and registrar cache for multi-TLD availability and smart suggestions.
+      security: []
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: tlds
+          in: query
+          schema:
+            type: string
+            example: com,net,org,com.bd
+      responses:
+        '200':
+          description: Search results
+
+  /v1/domains/check:
+    get:
+      summary: Authoritative Domain Availability Check
+      description: Checks syntax, authoritative registrar availability, and real-time premium pricing.
+      security: []
+      parameters:
+        - name: domain
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: currency
+          in: query
+          schema:
+            type: string
+            enum: [USD, BDT]
+      responses:
+        '200':
+          description: Domain availability result
+
+  /v1/domains/register:
+    post:
+      summary: Register a Domain
+      description: Purchases and registers a domain via authoritative registrar adapter.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain, years]
+              properties:
+                domain:
+                  type: string
+                years:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+      responses:
+        '202':
+          description: Domain registration initiated
+
+  /v1/dns/zones:
+    get:
+      summary: List Authoritative DNS Zones
+      responses:
+        '200':
+          description: List of DNS zones
+    post:
+      summary: Create DNS Zone
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain]
+              properties:
+                domain:
+                  type: string
+      responses:
+        '201':
+          description: Zone created
+
+  /v1/dns/zones/{zone_id}/records:
+    get:
+      summary: List DNS Records in Zone
+      parameters:
+        - name: zone_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: DNS records
+    post:
+      summary: Create or Update DNS Record
+      parameters:
+        - name: zone_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, name, content, ttl]
+              properties:
+                type:
+                  type: string
+                  enum: [A, AAAA, CNAME, MX, TXT, NS, SRV, CAA]
+                name:
+                  type: string
+                content:
+                  type: string
+                ttl:
+                  type: integer
+                  default: 300
+      responses:
+        '201':
+          description: DNS record published
+
+  /v1/hosting/accounts:
+    get:
+      summary: List Web Hosting Accounts
+      responses:
+        '200':
+          description: Hosting accounts
+    post:
+      summary: Provision Web Hosting Account
+      description: Sets up shared hosting, WordPress, or WooCommerce with cPanel/CyberPanel isolation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain, plan]
+              properties:
+                domain:
+                  type: string
+                plan:
+                  type: string
+                  enum: [shared-starter, managed-wordpress, woocommerce-scale]
+      responses:
+        '201':
+          description: Hosting account provisioned
+
+  /v1/compute/instances:
+    get:
+      summary: List VPS and GPU Compute Instances
+      responses:
+        '200':
+          description: List of compute instances
+    post:
+      summary: Provision VPS or GPU Compute Instance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, plan, region, os_image]
+              properties:
+                name:
+                  type: string
+                plan:
+                  type: string
+                region:
+                  type: string
+                os_image:
+                  type: string
+                ssh_key:
+                  type: string
+      responses:
+        '202':
+          description: Instance provisioning queued
+
+  /v1/compute/instances/{instance_id}/reboot:
+    post:
+      summary: Soft/Hard Reboot Compute Instance
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '202':
+          description: Reboot signal sent
+
+  /v1/compute/instances/{instance_id}:
+    delete:
+      summary: Terminate Compute Instance
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '202':
+          description: Termination initiated
+
   /v1/databases/instances:
     get:
       summary: List Managed Database Instances
-      description: Retrieves all active database instances for the authenticated tenant.
       responses:
         '200':
           description: List of database instances
@@ -113,8 +461,7 @@ paths:
                 items:
                   $ref: '#/components/schemas/DatabaseInstance'
     post:
-      summary: Provision a New Managed Database
-      description: Creates an automated PostgreSQL instance with PITR and continuous WAL streaming.
+      summary: Provision a New Sovereign Database
       requestBody:
         required: true
         content:
@@ -128,65 +475,34 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DatabaseInstance'
-        '429':
-          $ref: '#/components/responses/RateLimitError'
 
-  /v1/fleet/nodes:
-    get:
-      summary: List Global Edge Nodes
-      description: Retrieves edge PoP inventory and canary rollout statuses.
-      responses:
-        '200':
-          description: List of global edge nodes
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/FleetNode'
-
-  /v1/fleet/canary/deploy:
+  /v1/databases/instances/{instance_id}/pitr/restore:
     post:
-      summary: Trigger Zero-Downtime Canary Rollout
-      description: Initiates a staged canary rollout across global PoPs with automated rollback on error-budget burn.
+      summary: Point-In-Time Recovery (PITR) Restore
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [version, initial_percentage]
+              required: [target_timestamp]
               properties:
-                version:
+                target_timestamp:
                   type: string
-                  example: v1.4.2
-                initial_percentage:
-                  type: integer
-                  example: 5
+                  format: date-time
       responses:
         '202':
-          description: Canary rollout initiated
-
-  /v1/billing/invoices:
-    get:
-      summary: List Invoices
-      description: Retrieves billing invoices, usage breakdown, and payment receipts.
-      responses:
-        '200':
-          description: List of invoices
-
-  /v1/audit/records:
-    get:
-      summary: Query Merkle Audit Ledger
-      description: Queries tamper-proof cryptographic audit trail.
-      responses:
-        '200':
-          description: Cryptographic audit records
+          description: PITR recovery started
 
   /v1/usage/events:
     post:
       summary: Ingest Real-Time Telemetry Events
-      description: Ingests single or batch usage measurements (bandwidth, compute, DB storage, AI tokens).
       requestBody:
         required: true
         content:
@@ -203,17 +519,12 @@ paths:
                     properties:
                       event_id:
                         type: string
-                      idempotency_key:
-                        type: string
                       tenant_id:
                         type: string
                       metric:
                         type: string
                       value:
                         type: number
-                      timestamp:
-                        type: string
-                        format: date-time
       responses:
         '202':
           description: Telemetry events accepted for sliding window aggregation
@@ -221,7 +532,6 @@ paths:
   /v1/usage/tenant/{tenant_id}/current:
     get:
       summary: Get Real-Time Tenant Usage Snapshot
-      description: Returns multi-dimensional 1-minute, 1-hour, and cumulative usage along with live quota burn.
       parameters:
         - name: tenant_id
           in: path
@@ -235,7 +545,6 @@ paths:
   /v1/notifications/dispatch:
     post:
       summary: Broadcast System or User Event
-      description: Routes an event to all subscribed multi-channel destinations (Signed Webhooks, Email, SMS, Slack, Discord, PagerDuty).
       requestBody:
         required: true
         content:
@@ -248,7 +557,6 @@ paths:
                   type: string
                 type:
                   type: string
-                  example: io.aeitron.fleet.canary.rollback.v1
                 severity:
                   type: string
                   enum: [info, warning, error, critical]
@@ -258,12 +566,11 @@ paths:
                   type: string
       responses:
         '202':
-          description: Notification event accepted and queued for multi-channel broadcast
+          description: Notification event accepted
 
   /v1/notifications/subscriptions:
     post:
       summary: Create Alert Channel Subscription
-      description: Configures a destination (Webhook, Email, SMS, Slack, Discord, PagerDuty) for a tenant.
       requestBody:
         required: true
         content:
@@ -281,36 +588,49 @@ paths:
                   type: string
                 secret:
                   type: string
-                min_severity:
-                  type: string
-                  enum: [info, warning, error, critical]
       responses:
         '201':
-          description: Subscription created successfully
-    get:
-      summary: List Active Alert Subscriptions
-      parameters:
-        - name: tenant_id
-          in: query
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Active subscriptions for tenant
+          description: Subscription created
 
   /v1/notifications/dlq:
     get:
       summary: List Dead-Letter Queue (DLQ) Records
-      description: Returns failed webhook deliveries stored in the DLQ for review and replay.
-      parameters:
-        - name: tenant_id
-          in: query
-          schema:
-            type: string
       responses:
         '200':
           description: Dead-letter queue records
+
+  /v1/fleet/nodes:
+    get:
+      summary: List Global Edge Nodes
+      responses:
+        '200':
+          description: Edge node inventory
+
+  /v1/fleet/canary/deploy:
+    post:
+      summary: Trigger Canary Deployment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version, initial_percentage]
+              properties:
+                version:
+                  type: string
+                initial_percentage:
+                  type: integer
+      responses:
+        '202':
+          description: Canary rollout initiated
+
+  /v1/audit/records:
+    get:
+      summary: Query Merkle Cryptographic Audit Ledger
+      responses:
+        '200':
+          description: Audit ledger records
 
 components:
   securitySchemes:
@@ -336,13 +656,17 @@ components:
         expires_in:
           type: integer
           example: 3600
+        tenant_id:
+          type: string
+        tier:
+          type: string
 
     GatewayStats:
       type: object
       properties:
         total_requests:
           type: integer
-        active_upstreams:
+        active_connections:
           type: integer
         rate_limited_count:
           type: integer
@@ -351,27 +675,75 @@ components:
         uptime_seconds:
           type: integer
 
+    RouteRule:
+      type: object
+      properties:
+        path_prefix:
+          type: string
+        upstream_url:
+          type: string
+        rewrite_prefix:
+          type: string
+        allow_anonymous:
+          type: boolean
+        timeout:
+          type: integer
+
+    Product:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+        prices:
+          type: array
+          items:
+            type: object
+
+    QuoteCalculation:
+      type: object
+      properties:
+        subtotalMinorUnits:
+          type: integer
+        taxMinorUnits:
+          type: integer
+        totalMinorUnits:
+          type: integer
+        currency:
+          type: string
+
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+        tenantId:
+          type: string
+        status:
+          type: string
+        totalMinorUnits:
+          type: integer
+        currency:
+          type: string
+
     DatabaseInstance:
       type: object
       properties:
         id:
           type: string
-          example: db_inst_01
         name:
           type: string
-          example: production-postgres
         engine:
           type: string
-          example: postgresql-16
         region:
           type: string
-          example: eu-central-frankfurt
         status:
           type: string
-          example: running
         pitr_enabled:
           type: boolean
-          example: true
 
     CreateDatabaseRequest:
       type: object
@@ -388,65 +760,46 @@ components:
           type: integer
           default: 20
 
-    FleetNode:
+    ProblemDetails:
       type: object
+      required: [type, title, status, detail]
       properties:
-        id:
+        type:
           type: string
-        pop_id:
+          format: uri
+        title:
           type: string
-          example: fra-01
-        metro:
-          type: string
-          example: Frankfurt
-        health:
-          type: string
-          example: healthy
-        canary_weight:
+        status:
           type: integer
-          example: 100
+        detail:
+          type: string
+        instance:
+          type: string
+        request_id:
+          type: string
+        code:
+          type: string
+        error:
+          type: string
 
   responses:
     UnauthorizedError:
       description: Authentication failed or token missing/expired
       content:
-        application/json:
+        application/problem+json:
           schema:
-            type: object
-            properties:
-              error:
-                type: string
-                example: "unauthorized: invalid token signature"
+            $ref: '#/components/schemas/ProblemDetails'
 
     ForbiddenError:
       description: Insufficient permission scopes
       content:
-        application/json:
+        application/problem+json:
           schema:
-            type: object
-            properties:
-              error:
-                type: string
-                example: "forbidden: insufficient permission scopes"
+            $ref: '#/components/schemas/ProblemDetails'
 
     RateLimitError:
       description: Rate limit exceeded
-      headers:
-        Retry-After:
-          schema:
-            type: string
-          description: Seconds until retry is allowed
-        X-RateLimit-Limit:
-          schema:
-            type: string
-        X-RateLimit-Remaining:
-          schema:
-            type: string
       content:
-        application/json:
+        application/problem+json:
           schema:
-            type: object
-            properties:
-              error:
-                type: string
-                example: "rate limit exceeded for tenant: retry after 5s"
+            $ref: '#/components/schemas/ProblemDetails'

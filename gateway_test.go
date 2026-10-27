@@ -414,3 +414,205 @@ func TestAPIGateway_CORSAndHealth(t *testing.T) {
 		t.Errorf("expected stats.TotalRequests > 0, got %d", stats.TotalRequests)
 	}
 }
+
+func TestAPIGateway_ProblemDetailsFormat(t *testing.T) {
+	gw := NewAPIGateway("test-secret-32-bytes-rfc7807-suite")
+
+	// 1. Route Not Found -> 404 Problem Details
+	req := httptest.NewRequest(http.MethodGet, "/v1/unknown-endpoint", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Header().Get("Content-Type"), "application/problem+json") {
+		t.Errorf("expected application/problem+json Content-Type, got %s", rec.Header().Get("Content-Type"))
+	}
+
+	var problem ProblemDetails
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("failed to unmarshal ProblemDetails: %v", err)
+	}
+	if problem.Status != 404 || problem.Title != "Not Found" || problem.Code != "NOT_FOUND" {
+		t.Errorf("unexpected problem details: %+v", problem)
+	}
+
+	// 2. Unauthorized -> 401 Problem Details
+	req = httptest.NewRequest(http.MethodGet, "/v1/databases/instances", nil)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized, got %d", rec.Code)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("failed to unmarshal ProblemDetails: %v", err)
+	}
+	if problem.Status != 401 || problem.Title != "Unauthorized" || problem.Code != "UNAUTHORIZED" {
+		t.Errorf("unexpected unauthorized problem details: %+v", problem)
+	}
+}
+
+func TestAPIGateway_RouteRewriting(t *testing.T) {
+	var capturedPath string
+	commerceMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"available":true,"domain":"aeitron-cloud.com"}`))
+	}))
+	defer commerceMock.Close()
+
+	gw := NewAPIGateway("test-secret-32-bytes-rewrite-gate")
+
+	// Register rewritten route: /v1/domains -> /v1/commerce/domains
+	err := gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/domains",
+		UpstreamURL:    commerceMock.URL,
+		RewritePrefix:  "/v1/commerce/domains",
+		AllowAnonymous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to register route: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/domains/search?query=aeitron", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+	if capturedPath != "/v1/commerce/domains/search" {
+		t.Errorf("expected rewritten path '/v1/commerce/domains/search', got '%s'", capturedPath)
+	}
+}
+
+func TestAPIGateway_FastTokenIssuance(t *testing.T) {
+	gw := NewAPIGateway("test-secret-32-bytes-token-issue")
+
+	// Register API key
+	testKey := "aeitron_live_secret_key_1234567890abcdef"
+	gw.Authenticator().RegisterAPIKey(testKey, &TenantContext{
+		TenantID:  "tenant_acme",
+		OrgID:     "org_acme_corp",
+		ProjectID: "proj_prod",
+		ActorID:   "actor_service_worker",
+		Role:      "admin",
+		Scopes:    []string{"*"},
+		Tier:      "enterprise",
+	})
+
+	// Exchange API key for JWT token
+	reqBody := `{"api_key":"` + testKey + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/token", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for token exchange, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+		ExpiresIn   int    `json:"expires_in"`
+		TenantID    string `json:"tenant_id"`
+		Tier        string `json:"tier"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &tokenResp); err != nil {
+		t.Fatalf("failed to decode token response: %v", err)
+	}
+
+	if tokenResp.AccessToken == "" || tokenResp.TokenType != "Bearer" || tokenResp.TenantID != "tenant_acme" {
+		t.Errorf("invalid token response: %+v", tokenResp)
+	}
+
+	// Verify the issued JWT with gateway authenticator
+	testReq := httptest.NewRequest(http.MethodGet, "/dummy", nil)
+	testReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
+	ctx, err := gw.Authenticator().AuthenticateRequest(testReq)
+	if err != nil {
+		t.Fatalf("failed to authenticate newly issued JWT: %v", err)
+	}
+	if ctx.TenantID != "tenant_acme" || ctx.Tier != "enterprise" {
+		t.Errorf("unexpected claims in issued token: %+v", ctx)
+	}
+}
+
+func TestAPIGateway_SSRFValidator(t *testing.T) {
+	// Loopback rejection
+	if err := ValidateSafeTargetURL("http://127.0.0.1:8080/metrics"); err == nil {
+		t.Errorf("expected error for loopback 127.0.0.1")
+	}
+
+	// Cloud metadata IP rejection
+	if err := ValidateSafeTargetURL("http://169.254.169.254/latest/meta-data/"); err == nil {
+		t.Errorf("expected error for cloud metadata IP")
+	}
+
+	// Invalid scheme rejection
+	if err := ValidateSafeTargetURL("ftp://malicious.com/payload"); err == nil {
+		t.Errorf("expected error for ftp scheme")
+	}
+
+	// Safe public URL acceptance
+	if err := ValidateSafeTargetURL("https://example.com/webhook"); err != nil {
+		t.Errorf("unexpected error for valid public URL: %v", err)
+	}
+}
+
+func TestAPIGateway_DomainValidator(t *testing.T) {
+	validDomains := []string{"aeitron.com", "api.aeitron.com", "sub.domain.co.uk", "cloud-infra.io"}
+	for _, d := range validDomains {
+		if err := ValidateDomainName(d); err != nil {
+			t.Errorf("expected domain '%s' to be valid, got: %v", d, err)
+		}
+	}
+
+	invalidDomains := []string{"", "invalid domain with spaces", "https://aeitron.com", "domain..com", ".com"}
+	for _, d := range invalidDomains {
+		if err := ValidateDomainName(d); err == nil {
+			t.Errorf("expected domain '%s' to be rejected as invalid", d)
+		}
+	}
+}
+
+func TestAPIGateway_DefaultProductRoutes(t *testing.T) {
+	gw := NewAPIGateway("test-secret-32-bytes-routes-check")
+
+	expectedPrefixes := []string{
+		"/v1/auth",
+		"/v1/identity",
+		"/v1/organizations",
+		"/v1/audit",
+		"/v1/databases",
+		"/v1/backups",
+		"/v1/fleet",
+		"/v1/usage",
+		"/v1/notifications",
+		"/v1/billing",
+		"/v1/commerce",
+		"/v1/catalog",
+		"/v1/orders",
+		"/v1/domains",
+		"/v1/hosting",
+		"/v1/compute",
+		"/v1/subscriptions",
+		"/v1/invoices",
+		"/v1/emails",
+		"/v1/dns",
+		"/v1/router",
+		"/v1/edge",
+		"/v1/security",
+	}
+
+	for _, prefix := range expectedPrefixes {
+		rule, proxy := gw.matchRoute(prefix + "/test")
+		if rule == nil || proxy == nil {
+			t.Errorf("expected default route to match prefix '%s', got nil", prefix)
+		}
+	}
+}

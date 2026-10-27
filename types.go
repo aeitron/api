@@ -18,11 +18,13 @@ var (
 type RouteRule struct {
 	PathPrefix     string        `json:"path_prefix"`
 	UpstreamURL    string        `json:"upstream_url"`
+	RewritePrefix  string        `json:"rewrite_prefix,omitempty"` // Rewrites path prefix (e.g. /v1/domains -> /v1/commerce/domains)
 	StripPrefix    bool          `json:"strip_prefix"`
 	AllowAnonymous bool          `json:"allow_anonymous"`
 	RequiredScopes []string      `json:"required_scopes,omitempty"`
 	Timeout        time.Duration `json:"timeout"`
 	RateLimitTier  string        `json:"rate_limit_tier,omitempty"` // "free", "pro", "enterprise"
+	MaxBodyBytes   int64         `json:"max_body_bytes,omitempty"`  // Max request payload in bytes (default: 1MB)
 }
 
 // TenantContext contains verified tenant and actor identity extracted from credentials.

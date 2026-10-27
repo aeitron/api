@@ -126,8 +126,10 @@ func NewUpstreamProxy(rule RouteRule) (*UpstreamProxy, error) {
 		originalDirector(req)
 		req.Host = target.Host
 
-		// Strip prefix if requested
-		if rule.StripPrefix {
+		// Apply RewritePrefix or StripPrefix
+		if rule.RewritePrefix != "" {
+			req.URL.Path = rule.RewritePrefix + strings.TrimPrefix(req.URL.Path, rule.PathPrefix)
+		} else if rule.StripPrefix {
 			req.URL.Path = strings.TrimPrefix(req.URL.Path, rule.PathPrefix)
 			if !strings.HasPrefix(req.URL.Path, "/") {
 				req.URL.Path = "/" + req.URL.Path
@@ -145,9 +147,7 @@ func NewUpstreamProxy(rule RouteRule) (*UpstreamProxy, error) {
 
 	proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
 		cb.RecordResult(http.StatusBadGateway)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
-		_, _ = fmt.Fprintf(w, `{"error":"upstream gateway error: %s"}`, err.Error())
+		WriteBadGateway(w, req, fmt.Sprintf("upstream gateway error: %s", err.Error()))
 	}
 
 	return &UpstreamProxy{
@@ -160,10 +160,8 @@ func NewUpstreamProxy(rule RouteRule) (*UpstreamProxy, error) {
 
 func (up *UpstreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request, ctx *TenantContext, reqID string) {
 	if !up.circuitBreaker.Allow() {
-		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", "5")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(`{"error":"upstream service unavailable: circuit breaker is open"}`))
+		WriteServiceUnavailable(w, r, "upstream service unavailable: circuit breaker is open")
 		return
 	}
 
