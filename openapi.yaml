@@ -183,6 +183,55 @@ paths:
         '200':
           description: Cryptographic audit records
 
+  /v1/usage/events:
+    post:
+      summary: Ingest Real-Time Telemetry Events
+      description: Ingests single or batch usage measurements (bandwidth, compute, DB storage, AI tokens).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [events]
+              properties:
+                events:
+                  type: array
+                  items:
+                    type: object
+                    required: [event_id, tenant_id, metric, value]
+                    properties:
+                      event_id:
+                        type: string
+                      idempotency_key:
+                        type: string
+                      tenant_id:
+                        type: string
+                      metric:
+                        type: string
+                      value:
+                        type: number
+                      timestamp:
+                        type: string
+                        format: date-time
+      responses:
+        '202':
+          description: Telemetry events accepted for sliding window aggregation
+
+  /v1/usage/tenant/{tenant_id}/current:
+    get:
+      summary: Get Real-Time Tenant Usage Snapshot
+      description: Returns multi-dimensional 1-minute, 1-hour, and cumulative usage along with live quota burn.
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Real-time tenant usage snapshot
+
 components:
   securitySchemes:
     ApiKeyAuth:
