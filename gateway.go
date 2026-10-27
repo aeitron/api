@@ -23,6 +23,7 @@ type APIGateway struct {
 	authenticator *Authenticator
 	limiter       *TokenBucketLimiter
 	idempotency   *IdempotencyEngine
+	cache         *RFC9111CacheEngine
 	auditSpooler  *AuditSpooler
 	stats         GatewayStats
 	startTime     time.Time
@@ -35,6 +36,7 @@ func NewAPIGateway(jwtSecret string) *APIGateway {
 		authenticator: NewAuthenticator(jwtSecret),
 		limiter:       NewTokenBucketLimiter(),
 		idempotency:   NewIdempotencyEngine(24 * time.Hour),
+		cache:         NewRFC9111CacheEngine(10000, 64*1024*1024),
 		auditSpooler:  NewAuditSpooler(2000),
 		stats: GatewayStats{
 			StatusCodes:    make(map[int]int64),
@@ -67,9 +69,10 @@ func NewAPIGateway(jwtSecret string) *APIGateway {
 		{PathPrefix: "/v1/commerce", UpstreamURL: "http://127.0.0.1:8098", AllowAnonymous: true, Timeout: 15 * time.Second},
 
 		// Canonical Product Domains (Route directly with URL rewriting to commerce backend)
-		{PathPrefix: "/v1/catalog", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/catalog", AllowAnonymous: true, Timeout: 10 * time.Second},
+		{PathPrefix: "/v1/catalog", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/catalog", AllowAnonymous: true, CacheTTL: 60 * time.Second, Timeout: 10 * time.Second},
 		{PathPrefix: "/v1/orders", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/orders", AllowAnonymous: false, Timeout: 20 * time.Second},
-		{PathPrefix: "/v1/domains", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/domains", AllowAnonymous: true, Timeout: 20 * time.Second},
+		{PathPrefix: "/v1/domains", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/domains", AllowAnonymous: true, CacheTTL: 30 * time.Second, Timeout: 20 * time.Second},
+		{PathPrefix: "/v1/status", UpstreamURL: "http://127.0.0.1:3002", AllowAnonymous: true, CacheTTL: 15 * time.Second, Timeout: 10 * time.Second},
 		{PathPrefix: "/v1/hosting", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/hosting", AllowAnonymous: false, Timeout: 30 * time.Second},
 		{PathPrefix: "/v1/compute", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/compute", AllowAnonymous: false, Timeout: 30 * time.Second},
 		{PathPrefix: "/v1/subscriptions", UpstreamURL: "http://127.0.0.1:8098", RewritePrefix: "/v1/commerce/subscriptions", AllowAnonymous: false, Timeout: 15 * time.Second},
@@ -98,6 +101,11 @@ func (gw *APIGateway) Authenticator() *Authenticator {
 // Idempotency returns the gateway's idempotency engine component.
 func (gw *APIGateway) Idempotency() *IdempotencyEngine {
 	return gw.idempotency
+}
+
+// Cache returns the gateway's RFC 9111 edge caching engine component.
+func (gw *APIGateway) Cache() *RFC9111CacheEngine {
+	return gw.cache
 }
 
 // AuditSpooler returns the gateway's audit spooler component.
@@ -192,6 +200,25 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		st.UptimeSeconds = int64(time.Since(gw.startTime).Seconds())
 		gw.mu.RUnlock()
 		writeJSONResponse(w, http.StatusOK, st)
+		return
+	}
+	if (r.URL.Path == "/v1/gateway/cache/purge" || r.URL.Path == "/v1/gateway/cache") && (r.Method == http.MethodPost || r.Method == http.MethodDelete) {
+		var purgeReq struct {
+			Prefix   string `json:"prefix"`
+			PurgeAll bool   `json:"purge_all"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&purgeReq)
+		evicted := 0
+		if purgeReq.PurgeAll || (purgeReq.Prefix == "" && r.Method == http.MethodDelete) {
+			evicted = gw.cache.PurgeAll()
+		} else if purgeReq.Prefix != "" {
+			evicted = gw.cache.InvalidatePrefix(purgeReq.Prefix)
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"status":        "purged",
+			"evicted_count": evicted,
+			"remaining":     gw.cache.Size(),
+		})
 		return
 	}
 
@@ -380,14 +407,95 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		isIdempReq = true
 	}
 
-	// 11. Forward via Reverse Proxy
+	// 11. RFC 9111 Edge Caching & ETag Validation (304 Not Modified)
+	var (
+		cacheKey        string
+		isCacheEligible bool
+	)
+
+	cacheable, bypassLookup := gw.cache.IsRequestCacheable(r)
+	if cacheable && rule.CacheTTL > 0 {
+		isCacheEligible = true
+		cacheScope := "public"
+		if tenantCtx != nil && !rule.AllowAnonymous {
+			cacheScope = tenantCtx.TenantID
+		}
+
+		cacheKey = gw.cache.NormalizeKey(cacheScope, r.Method, r.URL.Path, r.URL.RawQuery)
+
+		if !bypassLookup {
+			entry, hit := gw.cache.Lookup(cacheKey)
+			if hit && entry != nil {
+				// Conditional validation for 304 Not Modified
+				if gw.cache.ValidateConditional(r, entry) {
+					w.Header().Set("ETag", entry.ETag)
+					if entry.LastModified != "" {
+						w.Header().Set("Last-Modified", entry.LastModified)
+					}
+					w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(entry.TTL.Seconds())))
+					w.Header().Set("Age", fmt.Sprintf("%d", entry.AgeSeconds()))
+					w.Header().Set("X-Cache", "HIT")
+					w.WriteHeader(http.StatusNotModified)
+
+					gw.mu.Lock()
+					gw.stats.StatusCodes[http.StatusNotModified]++
+					gw.mu.Unlock()
+					return
+				}
+
+				// Cache Hit (Full 200 OK)
+				for k, v := range entry.Headers {
+					w.Header().Set(k, v)
+				}
+				w.Header().Set("ETag", entry.ETag)
+				if entry.LastModified != "" {
+					w.Header().Set("Last-Modified", entry.LastModified)
+				}
+				w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(entry.TTL.Seconds())))
+				w.Header().Set("Age", fmt.Sprintf("%d", entry.AgeSeconds()))
+				w.Header().Set("X-Cache", "HIT")
+				w.WriteHeader(entry.StatusCode)
+				if r.Method != http.MethodHead {
+					_, _ = w.Write(entry.Body)
+				}
+
+				gw.mu.Lock()
+				gw.stats.StatusCodes[entry.StatusCode]++
+				gw.mu.Unlock()
+				return
+			}
+		}
+	}
+
+	// 12. Forward via Reverse Proxy
 	wrapper := NewResponseWriterWrapper(w)
-	if isIdempReq {
+	if isIdempReq || isCacheEligible {
 		wrapper.BodyBuffer = &bytes.Buffer{}
+	}
+	if isCacheEligible {
+		w.Header().Set("X-Cache", "MISS")
 	}
 	proxy.ServeHTTP(wrapper, r, tenantCtx, reqID)
 
 	duration := time.Since(start)
+
+	// RFC 9111 Cache Population on successful read
+	if isCacheEligible && wrapper.StatusCode == http.StatusOK {
+		if gw.cache.IsResponseCacheable(wrapper.StatusCode, wrapper.Header()) {
+			ttl := gw.cache.ParseUpstreamTTL(wrapper.Header(), rule.CacheTTL)
+			if ttl > 0 {
+				gw.cache.Store(cacheKey, r.URL.Path, wrapper.StatusCode, wrapper.Header(), wrapper.BodyBuffer.Bytes(), ttl)
+			}
+		}
+	}
+
+	// RFC 9111 Section 4.4 Invalidation on successful state mutations
+	if isMutationMethod(r.Method) && wrapper.StatusCode >= 200 && wrapper.StatusCode < 400 {
+		gw.cache.InvalidatePrefix(r.URL.Path)
+		if rule.PathPrefix != "" {
+			gw.cache.InvalidatePrefix(rule.PathPrefix)
+		}
+	}
 
 	// Complete or abort idempotency lock based on response code
 	if isIdempReq {
@@ -399,7 +507,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 12. Record Stats
+	// 13. Record Stats
 	gw.mu.Lock()
 	gw.stats.StatusCodes[wrapper.StatusCode]++
 	gw.mu.Unlock()

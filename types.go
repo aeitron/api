@@ -25,6 +25,7 @@ type RouteRule struct {
 	Timeout        time.Duration `json:"timeout"`
 	RateLimitTier  string        `json:"rate_limit_tier,omitempty"` // "free", "pro", "enterprise"
 	MaxBodyBytes   int64         `json:"max_body_bytes,omitempty"`  // Max request payload in bytes (default: 1MB)
+	CacheTTL       time.Duration `json:"cache_ttl,omitempty"`       // RFC 9111 edge cache TTL (0 = bypass cache)
 }
 
 // TenantContext contains verified tenant and actor identity extracted from credentials.

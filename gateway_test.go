@@ -945,6 +945,291 @@ func TestAPIGateway_IdempotencyKey_TenantIsolation(t *testing.T) {
 	}
 }
 
+func TestAPIGateway_RFC9111_CacheHitAndMiss(t *testing.T) {
+	upstreamHits := int32(0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "public, max-age=120")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"plans":[{"id":"vps-micro","price":5}]}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("secret-key-32-bytes-cache-suite")
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/catalog",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+		CacheTTL:       60 * time.Second,
+	})
+
+	// 1. First Request: Cache MISS, calls upstream
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/catalog/plans", nil)
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on first request, got %d", rec1.Code)
+	}
+	if rec1.Header().Get("X-Cache") != "MISS" {
+		t.Errorf("expected X-Cache: MISS on first request, got %s", rec1.Header().Get("X-Cache"))
+	}
+	etag := rec1.Header().Get("ETag")
+	if etag == "" || !strings.Contains(etag, "aei_") {
+		t.Errorf("expected valid ETag header in response, got %s", etag)
+	}
+	if atomic.LoadInt32(&upstreamHits) != 1 {
+		t.Fatalf("expected upstream hits to be 1, got %d", upstreamHits)
+	}
+
+	// 2. Second Request: Cache HIT, served sub-millisecond without touching upstream
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/catalog/plans", nil)
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on cached request, got %d", rec2.Code)
+	}
+	if rec2.Header().Get("X-Cache") != "HIT" {
+		t.Errorf("expected X-Cache: HIT on second request, got %s", rec2.Header().Get("X-Cache"))
+	}
+	if rec2.Header().Get("ETag") != etag {
+		t.Errorf("expected matching ETag on hit, got %s", rec2.Header().Get("ETag"))
+	}
+	if rec2.Body.String() != `{"plans":[{"id":"vps-micro","price":5}]}` {
+		t.Errorf("unexpected cached response body: %s", rec2.Body.String())
+	}
+	// Crucial: Upstream was NOT hit a second time!
+	if atomic.LoadInt32(&upstreamHits) != 1 {
+		t.Fatalf("upstream hits must still be 1 after cache hit, got %d", upstreamHits)
+	}
+}
+
+func TestAPIGateway_RFC9111_ETag304NotModified(t *testing.T) {
+	upstreamHits := int32(0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"domain":"aeitron.io","available":true}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("secret-key-32-bytes-cache-suite")
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/domains",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+		CacheTTL:       30 * time.Second,
+	})
+
+	// 1. Initial request to populate cache and acquire ETag
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/domains/check?name=aeitron.io", nil)
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, req1)
+
+	etag := rec1.Header().Get("ETag")
+	if etag == "" {
+		t.Fatalf("expected ETag from first request")
+	}
+
+	// 2. Client sends conditional request with If-None-Match
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/domains/check?name=aeitron.io", nil)
+	req2.Header.Set("If-None-Match", etag)
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, req2)
+
+	// Must return 304 Not Modified with zero body bytes!
+	if rec2.Code != http.StatusNotModified {
+		t.Fatalf("expected 304 Not Modified, got %d", rec2.Code)
+	}
+	if rec2.Body.Len() != 0 {
+		t.Fatalf("304 response must have empty body, got %d bytes", rec2.Body.Len())
+	}
+	if rec2.Header().Get("ETag") != etag {
+		t.Errorf("expected ETag header preserved on 304, got %s", rec2.Header().Get("ETag"))
+	}
+	if rec2.Header().Get("X-Cache") != "HIT" {
+		t.Errorf("expected X-Cache: HIT on 304, got %s", rec2.Header().Get("X-Cache"))
+	}
+	if atomic.LoadInt32(&upstreamHits) != 1 {
+		t.Fatalf("upstream hits must still be 1 (database/upstream saved from call), got %d", upstreamHits)
+	}
+}
+
+func TestAPIGateway_RFC9111_QueryParameterCanonicalization(t *testing.T) {
+	upstreamHits := int32(0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"items":["server1"]}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("secret-key-32-bytes-cache-suite")
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/catalog",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+		CacheTTL:       60 * time.Second,
+	})
+
+	// 1. First order: ?limit=10&region=sgp
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/catalog/items?limit=10&region=sgp", nil)
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, req1)
+
+	// 2. Permuted order: ?region=sgp&limit=10 (same semantic query!)
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/catalog/items?region=sgp&limit=10", nil)
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on canonicalized query request, got %d", rec2.Code)
+	}
+	if rec2.Header().Get("X-Cache") != "HIT" {
+		t.Errorf("expected X-Cache: HIT due to RFC 9111 query sorting, got %s", rec2.Header().Get("X-Cache"))
+	}
+	if atomic.LoadInt32(&upstreamHits) != 1 {
+		t.Fatalf("upstream should not be hit on permuted query params, hits: %d", upstreamHits)
+	}
+}
+
+func TestAPIGateway_RFC9111_ClientCacheBypass(t *testing.T) {
+	upstreamHits := int32(0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":"live"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("secret-key-32-bytes-cache-suite")
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/status",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+		CacheTTL:       30 * time.Second,
+	})
+
+	// Populate cache
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/status/summary", nil)
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, req1)
+	if atomic.LoadInt32(&upstreamHits) != 1 {
+		t.Fatalf("expected 1 hit on first call")
+	}
+
+	// Client sends Cache-Control: no-cache (forces revalidation/bypass)
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/status/summary", nil)
+	req2.Header.Set("Cache-Control", "no-cache")
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on bypass, got %d", rec2.Code)
+	}
+	if atomic.LoadInt32(&upstreamHits) != 2 {
+		t.Fatalf("upstream should be hit on Cache-Control: no-cache, hits: %d", upstreamHits)
+	}
+}
+
+func TestAPIGateway_RFC9111_MutationInvalidation(t *testing.T) {
+	upstreamHits := int32(0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"result":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("secret-key-32-bytes-cache-suite")
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/catalog",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+		CacheTTL:       60 * time.Second,
+	})
+
+	// 1. GET request caches resource
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/catalog/pricing", nil)
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, req1)
+	if atomic.LoadInt32(&upstreamHits) != 1 {
+		t.Fatalf("expected 1 upstream hit")
+	}
+
+	// Verify cached
+	if gw.Cache().Size() != 1 {
+		t.Fatalf("expected cache size 1, got %d", gw.Cache().Size())
+	}
+
+	// 2. Successful POST mutation on catalog invalidates cache per RFC 9111 Section 4.4
+	reqMut := httptest.NewRequest(http.MethodPost, "/v1/catalog/pricing", strings.NewReader(`{"new_price":10}`))
+	recMut := httptest.NewRecorder()
+	gw.ServeHTTP(recMut, reqMut)
+
+	if recMut.Code != http.StatusOK {
+		t.Fatalf("expected 200 on mutation, got %d", recMut.Code)
+	}
+
+	// Cache entry must have been evicted!
+	if gw.Cache().Size() != 0 {
+		t.Fatalf("expected cache size 0 after mutation invalidation, got %d", gw.Cache().Size())
+	}
+
+	// 3. Next GET request must be a MISS and re-fetch from upstream
+	req3 := httptest.NewRequest(http.MethodGet, "/v1/catalog/pricing", nil)
+	rec3 := httptest.NewRecorder()
+	gw.ServeHTTP(rec3, req3)
+
+	if rec3.Header().Get("X-Cache") != "MISS" {
+		t.Errorf("expected X-Cache: MISS after invalidation, got %s", rec3.Header().Get("X-Cache"))
+	}
+	if atomic.LoadInt32(&upstreamHits) != 3 {
+		t.Fatalf("expected 3 hits total, got %d", upstreamHits)
+	}
+}
+
+func TestAPIGateway_RFC9111_CachePurgeEndpoint(t *testing.T) {
+	gw := NewAPIGateway("secret-key-32-bytes-cache-suite")
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/catalog",
+		UpstreamURL:    "http://127.0.0.1:8098",
+		AllowAnonymous: true,
+		CacheTTL:       60 * time.Second,
+	})
+
+	// Manually populate cache entries
+	gw.Cache().Store("public:GET:/v1/catalog/items", "/v1/catalog/items", 200, http.Header{}, []byte(`{}`), 60*time.Second)
+	gw.Cache().Store("public:GET:/v1/catalog/plans", "/v1/catalog/plans", 200, http.Header{}, []byte(`{}`), 60*time.Second)
+
+	if gw.Cache().Size() != 2 {
+		t.Fatalf("expected 2 items in cache, got %d", gw.Cache().Size())
+	}
+
+	// Call DELETE /v1/gateway/cache to purge all
+	req := httptest.NewRequest(http.MethodDelete, "/v1/gateway/cache", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on cache purge, got %d", rec.Code)
+	}
+	var resp map[string]interface{}
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp["status"] != "purged" || resp["remaining"].(float64) != 0 {
+		t.Fatalf("unexpected purge response: %v", resp)
+	}
+	if gw.Cache().Size() != 0 {
+		t.Fatalf("cache should be empty after purge, got %d", gw.Cache().Size())
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

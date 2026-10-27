@@ -1,8 +1,10 @@
 package apigateway
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -142,6 +144,17 @@ func NewUpstreamProxy(rule RouteRule) (*UpstreamProxy, error) {
 
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		cb.RecordResult(resp.StatusCode)
+		if resp.StatusCode == http.StatusOK && resp.Request != nil &&
+			(resp.Request.Method == http.MethodGet || resp.Request.Method == http.MethodHead) {
+			if resp.Header.Get("ETag") == "" && resp.Body != nil {
+				bodyBytes, err := io.ReadAll(resp.Body)
+				if err == nil {
+					_ = resp.Body.Close()
+					resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+					resp.Header.Set("ETag", GenerateETag(bodyBytes))
+				}
+			}
+		}
 		return nil
 	}
 

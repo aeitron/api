@@ -811,6 +811,26 @@ components:
           schema:
             $ref: '#/components/schemas/ProblemDetails'
 
+    NotModifiedResponse:
+      description: RFC 9111 resource has not been modified since the specified ETag (saves network bandwidth)
+      headers:
+        ETag:
+          schema:
+            type: string
+            example: W/"aei_7a8b9c0d1e"
+        Cache-Control:
+          schema:
+            type: string
+            example: public, max-age=60
+        Age:
+          schema:
+            type: string
+            example: "12"
+        X-Cache:
+          schema:
+            type: string
+            example: HIT
+
   parameters:
     IdempotencyKeyHeader:
       name: Idempotency-Key
@@ -823,3 +843,13 @@ components:
         minLength: 8
         maxLength: 128
         example: ik_mutation_9a8b7c6d5e4f3a2b
+
+    IfNoneMatchHeader:
+      name: If-None-Match
+      in: header
+      description: |
+        RFC 9111 ETag value previously received. If the entity has not changed, gateway responds with HTTP 304 Not Modified.
+      required: false
+      schema:
+        type: string
+        example: W/"aei_7a8b9c0d1e"
