@@ -673,6 +673,278 @@ func TestAPIGateway_InteractiveDocsEndpoints(t *testing.T) {
 	}
 }
 
+func TestAPIGateway_IdempotencyKey_Replay(t *testing.T) {
+	upstreamHits := int32(0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"order_id":"ord_9901","status":"provisioned"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("secret-key-32-bytes-idempotency-suite")
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/orders",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+	})
+
+	idempKey := "ik_order_deploy_987654321"
+	reqPayload := `{"plan":"vps-singapore-metal","cores":8}`
+
+	// First Request: Must hit upstream and succeed
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/orders", strings.NewReader(reqPayload))
+	req1.Header.Set("Idempotency-Key", idempKey)
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created on initial request, got %d", rec1.Code)
+	}
+	if rec1.Header().Get("Idempotent-Replayed") == "true" {
+		t.Fatalf("initial request must not be marked as replayed")
+	}
+	if atomic.LoadInt32(&upstreamHits) != 1 {
+		t.Fatalf("expected upstream to be hit exactly 1 time, got %d", upstreamHits)
+	}
+
+	// Second Request: Network retry / duplicate submission with same key and payload
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/orders", strings.NewReader(reqPayload))
+	req2.Header.Set("Idempotency-Key", idempKey)
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created on replayed request, got %d", rec2.Code)
+	}
+	if rec2.Header().Get("Idempotent-Replayed") != "true" {
+		t.Fatalf("expected Idempotent-Replayed header to be 'true'")
+	}
+	if rec2.Body.String() != `{"order_id":"ord_9901","status":"provisioned"}` {
+		t.Fatalf("unexpected cached body: %s", rec2.Body.String())
+	}
+	// Crucial: Upstream was NOT hit a second time!
+	if atomic.LoadInt32(&upstreamHits) != 1 {
+		t.Fatalf("upstream hits must still be 1 (double-charge prevented), got %d", upstreamHits)
+	}
+
+	// Third Request: Using X-Idempotency-Key header alias
+	req3 := httptest.NewRequest(http.MethodPost, "/v1/orders", strings.NewReader(reqPayload))
+	req3.Header.Set("X-Idempotency-Key", idempKey)
+	req3.Header.Set("Content-Type", "application/json")
+	rec3 := httptest.NewRecorder()
+	gw.ServeHTTP(rec3, req3)
+
+	if rec3.Code != http.StatusCreated || rec3.Header().Get("Idempotent-Replayed") != "true" {
+		t.Fatalf("expected 201 Created and Idempotent-Replayed on X-Idempotency-Key alias")
+	}
+	if atomic.LoadInt32(&upstreamHits) != 1 {
+		t.Fatalf("upstream hits must still be 1, got %d", upstreamHits)
+	}
+}
+
+func TestAPIGateway_IdempotencyKey_PayloadMismatchConflict(t *testing.T) {
+	upstreamHits := int32(0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"success"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("secret-key-32-bytes-idempotency-suite")
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/orders",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+	})
+
+	idempKey := "ik_mismatch_check_88888888"
+
+	// 1. Initial request with payload A
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/orders", strings.NewReader(`{"amount":100}`))
+	req1.Header.Set("Idempotency-Key", idempKey)
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on first request, got %d", rec1.Code)
+	}
+
+	// 2. Reused key with payload B (Mismatch!)
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/orders", strings.NewReader(`{"amount":200}`))
+	req2.Header.Set("Idempotency-Key", idempKey)
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on payload mismatch, got %d", rec2.Code)
+	}
+
+	var problem ProblemDetails
+	if err := json.Unmarshal(rec2.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("failed to decode RFC 7807 problem: %v", err)
+	}
+	if problem.Code != "IDEMPOTENCY_KEY_MISMATCH" {
+		t.Errorf("expected code IDEMPOTENCY_KEY_MISMATCH, got %s", problem.Code)
+	}
+	if atomic.LoadInt32(&upstreamHits) != 1 {
+		t.Fatalf("upstream should not be hit on conflict, hits: %d", upstreamHits)
+	}
+}
+
+func TestAPIGateway_IdempotencyKey_InvalidFormat(t *testing.T) {
+	gw := NewAPIGateway("secret-key-32-bytes-idempotency-suite")
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/orders",
+		UpstreamURL:    "http://127.0.0.1:8098",
+		AllowAnonymous: true,
+	})
+
+	invalidKeys := []string{
+		"short",                     // < 8 characters
+		"key with spaces in middle", // contains illegal spaces
+		"key$$invalid%%characters",  // contains illegal symbols
+		strings.Repeat("a", 129),    // > 128 characters
+	}
+
+	for _, k := range invalidKeys {
+		req := httptest.NewRequest(http.MethodPost, "/v1/orders", strings.NewReader(`{}`))
+		req.Header.Set("Idempotency-Key", k)
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request for invalid key '%s', got %d", k, rec.Code)
+		}
+		var problem ProblemDetails
+		_ = json.Unmarshal(rec.Body.Bytes(), &problem)
+		if problem.Code != "INVALID_IDEMPOTENCY_KEY" {
+			t.Errorf("expected INVALID_IDEMPOTENCY_KEY, got %s", problem.Code)
+		}
+	}
+}
+
+func TestAPIGateway_IdempotencyKey_ServerErrorDoesNotCache(t *testing.T) {
+	attempt := int32(0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := atomic.AddInt32(&attempt, 1)
+		if cur == 1 {
+			// First attempt fails with 500
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"db temporary outage"}`))
+			return
+		}
+		// Second attempt succeeds with 200
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"recovered_and_created"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("secret-key-32-bytes-idempotency-suite")
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/compute",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+	})
+
+	idempKey := "ik_transient_failure_recovery_123"
+	payload := `{"instance_type":"c3-highcpu-8"}`
+
+	// 1. First attempt: 500 error from upstream
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/compute/instances", strings.NewReader(payload))
+	req1.Header.Set("Idempotency-Key", idempKey)
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 from failing upstream, got %d", rec1.Code)
+	}
+
+	// 2. Client safely retries with the SAME idempotency key after transient failure
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/compute/instances", strings.NewReader(payload))
+	req2.Header.Set("Idempotency-Key", idempKey)
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on retry, got %d", rec2.Code)
+	}
+	if rec2.Body.String() != `{"status":"recovered_and_created"}` {
+		t.Fatalf("expected successful recovered body on retry: %s", rec2.Body.String())
+	}
+	if atomic.LoadInt32(&attempt) != 2 {
+		t.Fatalf("expected 2 attempts due to 5xx failure un-locking, got %d", attempt)
+	}
+}
+
+func TestAPIGateway_IdempotencyKey_TenantIsolation(t *testing.T) {
+	upstreamHits := int32(0)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		tenant := r.Header.Get("X-Tenant-ID")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"tenant":"` + tenant + `"}`))
+	}))
+	defer upstream.Close()
+
+	secret := "secret-key-32-bytes-tenant-isolation-suite"
+	gw := NewAPIGateway(secret)
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/orders",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: false,
+	})
+
+	// Generate tokens for Tenant A and Tenant B
+	tokenA, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "user_a",
+		TenantID: "tenant_alpha_111",
+		Role:     "admin",
+		Exp:      time.Now().Add(1 * time.Hour).Unix(),
+	})
+	tokenB, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "user_b",
+		TenantID: "tenant_bravo_222",
+		Role:     "admin",
+		Exp:      time.Now().Add(1 * time.Hour).Unix(),
+	})
+
+	sharedKey := "ik_identically_named_key_12345"
+
+	// Tenant A request
+	reqA := httptest.NewRequest(http.MethodPost, "/v1/orders", strings.NewReader(`{"item":"license_a"}`))
+	reqA.Header.Set("Authorization", "Bearer "+tokenA)
+	reqA.Header.Set("Idempotency-Key", sharedKey)
+	recA := httptest.NewRecorder()
+	gw.ServeHTTP(recA, reqA)
+
+	if recA.Code != http.StatusOK {
+		t.Fatalf("expected 200 for Tenant A, got %d", recA.Code)
+	}
+
+	// Tenant B request with SAME idempotency key (must NOT collide or conflict)
+	reqB := httptest.NewRequest(http.MethodPost, "/v1/orders", strings.NewReader(`{"item":"license_b"}`))
+	reqB.Header.Set("Authorization", "Bearer "+tokenB)
+	reqB.Header.Set("Idempotency-Key", sharedKey)
+	recB := httptest.NewRecorder()
+	gw.ServeHTTP(recB, reqB)
+
+	if recB.Code != http.StatusOK {
+		t.Fatalf("expected 200 for Tenant B (tenant isolation must prevent key conflict), got %d", recB.Code)
+	}
+
+	if atomic.LoadInt32(&upstreamHits) != 2 {
+		t.Fatalf("expected both tenants to reach upstream independently, got %d hits", upstreamHits)
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

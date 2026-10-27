@@ -1,6 +1,7 @@
 package apigateway
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
@@ -27,11 +28,12 @@ func ExtractOrGenerateRequestID(r *http.Request) string {
 	return GenerateRequestID()
 }
 
-// ResponseWriterWrapper intercepts and records the HTTP response status and written byte count.
+// ResponseWriterWrapper intercepts and records the HTTP response status, written byte count, and optional body buffer.
 type ResponseWriterWrapper struct {
 	http.ResponseWriter
 	StatusCode   int
 	BytesWritten int64
+	BodyBuffer   *bytes.Buffer
 }
 
 // NewResponseWriterWrapper creates a wrapper defaulting to status 200 OK.
@@ -48,6 +50,9 @@ func (rw *ResponseWriterWrapper) WriteHeader(statusCode int) {
 }
 
 func (rw *ResponseWriterWrapper) Write(b []byte) (int, error) {
+	if rw.BodyBuffer != nil {
+		rw.BodyBuffer.Write(b)
+	}
 	n, err := rw.ResponseWriter.Write(b)
 	rw.BytesWritten += int64(n)
 	return n, err
@@ -69,8 +74,8 @@ func HandleCORS(w http.ResponseWriter, r *http.Request) bool {
 	}
 	w.Header().Set("Access-Control-Allow-Origin", origin)
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization, X-API-Key, Content-Type, X-Request-ID, Accept")
-	w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, X-API-Key, Content-Type, X-Request-ID, Accept, Idempotency-Key, X-Idempotency-Key")
+	w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Idempotent-Replayed")
 	w.Header().Set("Access-Control-Max-Age", "86400")
 
 	if r.Method == http.MethodOptions {

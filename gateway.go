@@ -3,6 +3,7 @@ package apigateway
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,6 +22,7 @@ type APIGateway struct {
 	proxies       map[string]*UpstreamProxy
 	authenticator *Authenticator
 	limiter       *TokenBucketLimiter
+	idempotency   *IdempotencyEngine
 	auditSpooler  *AuditSpooler
 	stats         GatewayStats
 	startTime     time.Time
@@ -32,6 +34,7 @@ func NewAPIGateway(jwtSecret string) *APIGateway {
 		proxies:       make(map[string]*UpstreamProxy),
 		authenticator: NewAuthenticator(jwtSecret),
 		limiter:       NewTokenBucketLimiter(),
+		idempotency:   NewIdempotencyEngine(24 * time.Hour),
 		auditSpooler:  NewAuditSpooler(2000),
 		stats: GatewayStats{
 			StatusCodes:    make(map[int]int64),
@@ -90,6 +93,11 @@ func NewAPIGateway(jwtSecret string) *APIGateway {
 // Authenticator returns the gateway's authentication component.
 func (gw *APIGateway) Authenticator() *Authenticator {
 	return gw.authenticator
+}
+
+// Idempotency returns the gateway's idempotency engine component.
+func (gw *APIGateway) Idempotency() *IdempotencyEngine {
+	return gw.idempotency
 }
 
 // AuditSpooler returns the gateway's audit spooler component.
@@ -304,18 +312,99 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
 	}
 
-	// 9. Forward via Reverse Proxy
+	// 10. Stripe-grade Idempotency-Key Engine (Mutation Protection)
+	var (
+		idempKey    string
+		isIdempReq  bool
+		bodyBytes   []byte
+		scopeTenant string
+	)
+
+	if isMutationMethod(r.Method) {
+		idempKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		if idempKey == "" {
+			idempKey = strings.TrimSpace(r.Header.Get("X-Idempotency-Key"))
+		}
+	}
+
+	if idempKey != "" {
+		if err := ValidateIdempotencyKey(idempKey); err != nil {
+			WriteBadRequest(w, r, fmt.Sprintf("invalid idempotency key: %s", err.Error()), "INVALID_IDEMPOTENCY_KEY")
+			return
+		}
+
+		scopeTenant = clientIP
+		if tenantCtx != nil && tenantCtx.TenantID != "" {
+			scopeTenant = tenantCtx.TenantID
+		}
+
+		// Read and restore request body for payload fingerprinting
+		var readErr error
+		bodyBytes, readErr = io.ReadAll(r.Body)
+		if readErr != nil {
+			WriteBadRequest(w, r, "unable to read request body for idempotency validation", "INVALID_REQUEST_BODY")
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+		rec, isReplay, acqErr := gw.idempotency.AcquireOrReplay(scopeTenant, idempKey, r.Method, r.URL.Path, bodyBytes, 2*time.Second)
+		if acqErr != nil {
+			if errors.Is(acqErr, ErrIdempotencyMismatch) {
+				WriteConflict(w, r, "keys with identical idempotency values must send identical request parameters", "IDEMPOTENCY_KEY_MISMATCH")
+				return
+			}
+			if errors.Is(acqErr, ErrIdempotencyInFlight) {
+				w.Header().Set("Retry-After", "1")
+				WriteConflict(w, r, "a request with this idempotency key is currently in progress", "IDEMPOTENCY_KEY_IN_FLIGHT")
+				return
+			}
+			WriteBadRequest(w, r, acqErr.Error(), "IDEMPOTENCY_ERROR")
+			return
+		}
+
+		if isReplay && rec != nil {
+			// Replay cached response
+			w.Header().Set("Idempotent-Replayed", "true")
+			for k, v := range rec.Headers {
+				w.Header().Set(k, v)
+			}
+			w.WriteHeader(rec.StatusCode)
+			_, _ = w.Write(rec.ResponseBody)
+
+			gw.mu.Lock()
+			gw.stats.StatusCodes[rec.StatusCode]++
+			gw.mu.Unlock()
+			return
+		}
+
+		isIdempReq = true
+	}
+
+	// 11. Forward via Reverse Proxy
 	wrapper := NewResponseWriterWrapper(w)
+	if isIdempReq {
+		wrapper.BodyBuffer = &bytes.Buffer{}
+	}
 	proxy.ServeHTTP(wrapper, r, tenantCtx, reqID)
 
 	duration := time.Since(start)
 
-	// 10. Record Stats
+	// Complete or abort idempotency lock based on response code
+	if isIdempReq {
+		if wrapper.StatusCode < 500 {
+			gw.idempotency.Complete(scopeTenant, idempKey, wrapper.StatusCode, wrapper.Header(), wrapper.BodyBuffer.Bytes())
+		} else {
+			// Server faults (5xx) do not lock or cache, allowing safe retry
+			gw.idempotency.Abort(scopeTenant, idempKey)
+		}
+	}
+
+	// 12. Record Stats
 	gw.mu.Lock()
 	gw.stats.StatusCodes[wrapper.StatusCode]++
 	gw.mu.Unlock()
 
-	// 11. Centralized Audit Logging on State Mutations
+	// 13. Centralized Audit Logging on State Mutations
 	if isMutationMethod(r.Method) && tenantCtx != nil {
 		gw.auditSpooler.Spool(AuditRecord{
 			RequestID:  reqID,

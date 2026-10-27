@@ -803,3 +803,23 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/ProblemDetails'
+
+    ConflictError:
+      description: Resource conflict or idempotency key payload mismatch
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+  parameters:
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      description: |
+        Stripe-grade unique idempotency key (8-128 characters matching [a-zA-Z0-9_-.:]) to prevent double-charges and duplicate mutations.
+      required: false
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+        example: ik_mutation_9a8b7c6d5e4f3a2b

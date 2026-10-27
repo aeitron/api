@@ -96,3 +96,19 @@ func WriteServiceUnavailable(w http.ResponseWriter, r *http.Request, detail stri
 func WriteValidationError(w http.ResponseWriter, r *http.Request, detail string) {
 	WriteProblem(w, r, http.StatusUnprocessableEntity, "Unprocessable Entity", detail, "VALIDATION_FAILED")
 }
+
+// WriteConflict returns a 409 Conflict problem.
+func WriteConflict(w http.ResponseWriter, r *http.Request, detail, code string) {
+	if code == "" {
+		code = "RESOURCE_CONFLICT"
+	}
+	WriteProblem(w, r, http.StatusConflict, "Conflict", detail, code)
+}
+
+// WriteBadRequest returns a 400 Bad Request problem.
+func WriteBadRequest(w http.ResponseWriter, r *http.Request, detail, code string) {
+	if code == "" {
+		code = "BAD_REQUEST"
+	}
+	WriteProblem(w, r, http.StatusBadRequest, "Bad Request", detail, code)
+}
