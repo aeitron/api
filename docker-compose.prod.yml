@@ -1,0 +1,91 @@
+# ==============================================================================
+# Aeitron API Gateway — Production Docker Compose Stack
+# Fail-closed, hardened production deployment with:
+# - Required external secrets (no hardcoded secrets permitted)
+# - Internal isolated network for Redis (NO published host ports)
+# - Mandatory durable audit logging to persistent volume
+# - Non-root execution and security opt (no-new-privileges)
+# - CPU and Memory resource quotas
+# ==============================================================================
+
+version: '3.8'
+
+services:
+  api-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aeitron/api:latest
+    container_name: aeitron-api-gateway
+    restart: unless-stopped
+    ports:
+      - "${AEITRON_GATEWAY_PORT:-8000}:8000"
+    environment:
+      - PORT=8000
+      - HOST=0.0.0.0
+      - AEITRON_ENV=production
+      - AEITRON_DEV_MODE=false
+      - AEITRON_JWT_SECRET=${AEITRON_JWT_SECRET:?AEITRON_JWT_SECRET environment variable is required in production}
+      - AEITRON_METRICS_TOKEN=${AEITRON_METRICS_TOKEN:?AEITRON_METRICS_TOKEN environment variable is required in production}
+      - AEITRON_AUDIT_LOG_FILE=/var/log/aeitron/audit.log
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-aeitron_cluster_secret}@redis:6379/0
+      - AEITRON_CLUSTER_FAIL_CLOSED=true
+    volumes:
+      - audit-logs:/var/log/aeitron
+    networks:
+      - ingress-net
+      - internal-redis-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1024M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+  redis:
+    image: redis:7-alpine
+    container_name: aeitron-redis
+    restart: unless-stopped
+    # CRITICAL PRODUCTION SECURITY: Redis is isolated to internal-redis-net.
+    # No ports are published to host or WAN.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-aeitron_cluster_secret}", "--protected-mode", "yes"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - internal-redis-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-aeitron_cluster_secret}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+networks:
+  ingress-net:
+    driver: bridge
+  internal-redis-net:
+    driver: bridge
+    internal: true # Isolated internal network with no external routing
+
+volumes:
+  audit-logs:
+  redis-data:

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -663,17 +664,22 @@ func TestSecurityRegression_AuditSpoolerBackpressureAndDropMetrics(t *testing.T)
 }
 
 // TestSecurityRegression_CustomWebhookClient_ProxyAndTLSSSRF verifies that custom HTTP clients
-// supplied to WebhookEngine have their Proxy and DialTLSContext sanitized, and SafeDialContext enforced.
+// supplied to WebhookEngine have their Proxy, DialTLSContext, and legacy DialTLS sanitized,
+// and SafeDialContext enforced with production precedence over development flags.
 func TestSecurityRegression_CustomWebhookClient_ProxyAndTLSSSRF(t *testing.T) {
-	t.Setenv("AEITRON_DEV_MODE", "false")
+	// Set conflicting environment variables: production MUST strictly override dev mode
+	t.Setenv("AEITRON_DEV_MODE", "true")
 	t.Setenv("AEITRON_ENV", "production")
 
-	// Custom transport attempting proxy to metadata endpoint and custom TLS dialer
+	// Custom transport attempting proxy to metadata endpoint and both modern and legacy TLS dialers
 	proxyURL, _ := url.Parse("http://169.254.169.254:8080")
 	customTransport := &http.Transport{
 		Proxy: http.ProxyURL(proxyURL),
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return nil, errors.New("custom TLS dialer should have been cleared")
+			return nil, errors.New("custom DialTLSContext should have been cleared")
+		},
+		DialTLS: func(network, addr string) (net.Conn, error) {
+			return nil, errors.New("legacy DialTLS callback should have been cleared")
 		},
 	}
 
@@ -693,12 +699,15 @@ func TestSecurityRegression_CustomWebhookClient_ProxyAndTLSSSRF(t *testing.T) {
 		t.Fatalf("expected customTransport.Proxy to be sanitized to nil, but it was retained")
 	}
 
-	// 2. Verify DialTLSContext is wiped on custom transport
+	// 2. Verify DialTLSContext and legacy DialTLS are wiped on custom transport
 	if customTransport.DialTLSContext != nil {
 		t.Fatalf("expected customTransport.DialTLSContext to be sanitized to nil, but it was retained")
 	}
+	if customTransport.DialTLS != nil {
+		t.Fatalf("expected legacy customTransport.DialTLS to be sanitized to nil, but it was retained")
+	}
 
-	// 3. Verify that requests using engine's client to internal/metadata addresses are blocked by SafeDialContext
+	// 3. Verify that requests using engine's client to metadata addresses are blocked by SafeDialContext
 	req, _ := http.NewRequest(http.MethodPost, "http://169.254.169.254/latest/meta-data", strings.NewReader("{}"))
 	_, err := engine.client.Do(req)
 	if err == nil {
@@ -708,7 +717,7 @@ func TestSecurityRegression_CustomWebhookClient_ProxyAndTLSSSRF(t *testing.T) {
 		t.Fatalf("expected SSRF block error, got %v", err)
 	}
 
-	// 4. Verify request to private 10.0.0.1 is blocked in production mode
+	// 4. Verify request to private 10.0.0.1 is blocked
 	req2, _ := http.NewRequest(http.MethodPost, "http://10.0.0.1:8080/webhook", strings.NewReader("{}"))
 	_, err2 := engine.client.Do(req2)
 	if err2 == nil {
@@ -717,6 +726,16 @@ func TestSecurityRegression_CustomWebhookClient_ProxyAndTLSSSRF(t *testing.T) {
 	if !strings.Contains(err2.Error(), "prohibited") && !strings.Contains(err2.Error(), "blocked") {
 		t.Fatalf("expected private IP block error, got %v", err2)
 	}
+
+	// 5. Verify loopback (127.0.0.1) is BLOCKED despite AEITRON_DEV_MODE=true because AEITRON_ENV=production takes precedence
+	req3, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:8080/webhook", strings.NewReader("{}"))
+	_, err3 := engine.client.Do(req3)
+	if err3 == nil {
+		t.Fatalf("expected loopback request to be blocked under production precedence, but it succeeded")
+	}
+	if !strings.Contains(err3.Error(), "prohibited") && !strings.Contains(err3.Error(), "blocked") {
+		t.Fatalf("expected loopback block error under production precedence, got %v", err3)
+	}
 }
 
 // TestSecurityRegression_AuditSpooler_DurableFileFallbackAndErrors verifies durable storage fallback,
@@ -724,6 +743,7 @@ func TestSecurityRegression_CustomWebhookClient_ProxyAndTLSSSRF(t *testing.T) {
 func TestSecurityRegression_AuditSpooler_DurableFileFallbackAndErrors(t *testing.T) {
 	metrics := NewMetricsCollector(time.Now())
 	spooler := NewAuditSpooler(2)
+	defer spooler.Close()
 	spooler.SetOnFileError(metrics.RecordAuditFileError)
 
 	tmpDir := t.TempDir()
@@ -767,5 +787,71 @@ func TestSecurityRegression_AuditSpooler_DurableFileFallbackAndErrors(t *testing
 	}
 	if metrics.AuditFileErrorCount() == 0 {
 		t.Fatalf("expected metrics.AuditFileErrorCount > 0")
+	}
+}
+
+// TestSecurityRegression_AuditSpooler_CompletenessAndRestartRecovery verifies record completeness,
+// hardware write synchronization, crash restart recovery, and production validation.
+func TestSecurityRegression_AuditSpooler_CompletenessAndRestartRecovery(t *testing.T) {
+	tmpDir := t.TempDir()
+	logFile := filepath.Join(tmpDir, "audit_persistent.log")
+
+	t.Setenv("AEITRON_ENV", "production")
+	t.Setenv("AEITRON_AUDIT_LOG_FILE", logFile)
+
+	spooler1 := NewAuditSpooler(100)
+
+	// Verify durable storage validation passes with writable file
+	if err := spooler1.ValidateDurableStorage(); err != nil {
+		t.Fatalf("expected ValidateDurableStorage to pass for valid path, got: %v", err)
+	}
+
+	// Write 25 audit records with distinct request IDs
+	const numRecords = 25
+	for i := 0; i < numRecords; i++ {
+		spooler1.Spool(AuditRecord{
+			RequestID: fmt.Sprintf("req_audit_order_%d", i),
+			TenantID:  "tenant_prod_1",
+			ActorID:   "actor_audit_user",
+			Method:    "POST",
+			Path:      "/v1/orders",
+			Timestamp: time.Now().UTC(),
+		})
+	}
+
+	// Graceful shutdown: drains channel and flushes all writes to disk with f.Sync()
+	spooler1.Close()
+
+	// Verify 100% record completeness using RecoverAuditRecords
+	recovered, err := RecoverAuditRecords(logFile)
+	if err != nil {
+		t.Fatalf("failed to recover audit records: %v", err)
+	}
+	if len(recovered) != numRecords {
+		t.Fatalf("expected %d recovered records, got %d (loss of audit records detected!)", numRecords, len(recovered))
+	}
+
+	for i := 0; i < numRecords; i++ {
+		expectedID := fmt.Sprintf("req_audit_order_%d", i)
+		if recovered[i].RequestID != expectedID {
+			t.Fatalf("record index %d: expected ID %q, got %q", i, expectedID, recovered[i].RequestID)
+		}
+	}
+
+	// Simulate process restart: create a new AuditSpooler pointing to the same log file
+	spooler2 := NewAuditSpooler(100)
+	defer spooler2.Close()
+
+	rehydrated := spooler2.GetRecords()
+	if len(rehydrated) != numRecords {
+		t.Fatalf("expected rehydrated records on restart to be %d, got %d", numRecords, len(rehydrated))
+	}
+
+	// Verify fail-fast validation in production when file path is invalid/unwritable
+	spoolerInvalid := NewAuditSpooler(10)
+	defer spoolerInvalid.Close()
+	spoolerInvalid.SetDurablePath(filepath.Join(tmpDir, "missing_dir", "deep", "audit.log"))
+	if err := spoolerInvalid.ValidateDurableStorage(); err == nil {
+		t.Fatalf("expected ValidateDurableStorage to fail for unwritable directory in production")
 	}
 }

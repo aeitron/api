@@ -55,6 +55,13 @@ func main() {
 
 	gw := apigateway.NewAPIGateway(jwtSecret)
 
+	// In production, validate durable audit storage fail-fast before serving traffic
+	if isProd {
+		if err := gw.AuditSpooler().ValidateDurableStorage(); err != nil {
+			log.Fatalf("[FATAL] Durable audit storage validation failed: %v. In production, durable audit logging is mandatory.", err)
+		}
+	}
+
 	addr := fmt.Sprintf("%s:%s", host, port)
 	server := &http.Server{
 		Addr:         addr,

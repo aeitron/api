@@ -289,6 +289,9 @@ func (gw *APIGateway) Close() {
 	if gw.eventEngine != nil {
 		gw.eventEngine.Close()
 	}
+	if gw.auditSpooler != nil {
+		gw.auditSpooler.Close()
+	}
 	if gw.stateAdapter != nil {
 		_ = gw.stateAdapter.Close()
 	}

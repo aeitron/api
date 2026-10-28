@@ -2,6 +2,7 @@ package apigateway
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"time"
 )
@@ -150,4 +151,15 @@ type AuditRecord struct {
 	DurationMs   int64     `json:"duration_ms"`
 	Timestamp    time.Time `json:"timestamp"`
 	ResponseBody string    `json:"response_body,omitempty"`
+}
+
+// IsProductionEnv returns true if running under production mode (AEITRON_ENV=production or AEITRON_DEV_MODE=false).
+// In accordance with fail-closed security invariants, production mode strictly overrides any development flags.
+func IsProductionEnv() bool {
+	return strings.EqualFold(os.Getenv("AEITRON_ENV"), "production") || strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "false")
+}
+
+// IsDevelopmentEnv returns true only when explicitly in development mode and NOT overridden by production mode.
+func IsDevelopmentEnv() bool {
+	return !IsProductionEnv() && (strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "true") || strings.EqualFold(os.Getenv("AEITRON_ENV"), "development"))
 }

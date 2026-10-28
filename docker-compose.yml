@@ -1,3 +1,11 @@
+# ==============================================================================
+# Aeitron API Gateway — Development Docker Compose Stack
+# FOR LOCAL DEVELOPMENT AND TESTING ONLY.
+# Do NOT use this file in production environments.
+# For production deployments with network isolation, secret validation,
+# and non-root execution, use: docker compose -f docker-compose.prod.yml up -d
+# ==============================================================================
+
 version: '3.8'
 
 services:

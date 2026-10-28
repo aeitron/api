@@ -1,10 +1,12 @@
 package apigateway
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -111,8 +113,8 @@ func IsOriginAllowed(origin string) bool {
 		return true
 	}
 
-	// 3. In development mode, allow localhost and 127.0.0.1 on any port
-	isDev := !strings.EqualFold(os.Getenv("AEITRON_ENV"), "production") || strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "true")
+	// 3. In development mode, allow localhost and 127.0.0.1 on any port (strictly overridden by production mode)
+	isDev := IsDevelopmentEnv()
 	if isDev {
 		if strings.HasPrefix(originLower, "http://localhost") || strings.HasPrefix(originLower, "http://127.0.0.1") ||
 			strings.HasPrefix(originLower, "https://localhost") || strings.HasPrefix(originLower, "https://127.0.0.1") {
@@ -171,17 +173,34 @@ type AuditSpooler struct {
 	fileMu         sync.Mutex
 	onDrop         func()
 	onFileError    func()
+	done           chan struct{}
+	closed         atomic.Bool
 }
 
 // NewAuditSpooler creates a background audit spooler with optional durable storage.
+// In production mode, durable audit storage is mandatory to prevent silent record loss.
 func NewAuditSpooler(bufferSize int) *AuditSpooler {
 	if bufferSize <= 0 {
 		bufferSize = 1000
 	}
 	durablePath := os.Getenv("AEITRON_AUDIT_LOG_FILE")
+	if IsProductionEnv() && durablePath == "" {
+		// In production, enforce standard durable file fallback to prevent audit event loss
+		durablePath = "aeitron_audit.log"
+	}
 	spooler := &AuditSpooler{
 		ch:          make(chan AuditRecord, bufferSize),
 		durablePath: durablePath,
+		done:        make(chan struct{}),
+	}
+	// Rehydrate recent history from durable file if present (restart recovery)
+	if durablePath != "" {
+		if pastRecords, err := RecoverAuditRecords(durablePath); err == nil && len(pastRecords) > 0 {
+			if len(pastRecords) > 1000 {
+				pastRecords = pastRecords[len(pastRecords)-1000:]
+			}
+			spooler.records = pastRecords
+		}
 	}
 	go spooler.worker()
 	return spooler
@@ -208,7 +227,27 @@ func (s *AuditSpooler) SetDurablePath(path string) {
 	s.durablePath = path
 }
 
+// ValidateDurableStorage verifies that configured durable audit storage is writable.
+// If unwritable or missing in production, returns an error enabling fail-fast startup.
+func (s *AuditSpooler) ValidateDurableStorage() error {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	if s.durablePath == "" {
+		if IsProductionEnv() {
+			return errors.New("durable audit storage is mandatory in production: AEITRON_AUDIT_LOG_FILE must be configured")
+		}
+		return nil
+	}
+	f, err := os.OpenFile(s.durablePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("durable audit storage file %q is unwritable: %w", s.durablePath, err)
+	}
+	_ = f.Close()
+	return nil
+}
+
 func (s *AuditSpooler) worker() {
+	defer close(s.done)
 	for rec := range s.ch {
 		s.mu.Lock()
 		if len(s.records) > 5000 {
@@ -226,6 +265,13 @@ func (s *AuditSpooler) worker() {
 // Spool queues an audit event asynchronously. Under backpressure, records are written
 // to durable fallback storage rather than silently discarded, and droppedCount is incremented.
 func (s *AuditSpooler) Spool(rec AuditRecord) {
+	if s.closed.Load() {
+		// Spooler has been shut down; write directly to durable storage or stderr
+		if s.durablePath != "" {
+			s.writeDurable(rec)
+		}
+		return
+	}
 	select {
 	case s.ch <- rec:
 	default:
@@ -240,8 +286,7 @@ func (s *AuditSpooler) Spool(rec AuditRecord) {
 			s.writeDurable(rec)
 		} else {
 			// In production or when durablePath is unset, prevent silent loss by outputting to stderr
-			isProd := strings.EqualFold(os.Getenv("AEITRON_ENV"), "production") || strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "false")
-			if isProd {
+			if IsProductionEnv() {
 				if b, err := json.Marshal(rec); err == nil {
 					fmt.Fprintf(os.Stderr, "[CRITICAL AUDIT DROP] Queue saturated and no AEITRON_AUDIT_LOG_FILE configured: %s\n", string(b))
 				}
@@ -288,8 +333,19 @@ func (s *AuditSpooler) writeDurable(rec AuditRecord) {
 			fileErrCb()
 		}
 		fmt.Fprintf(os.Stderr, "[CRITICAL AUDIT DROP] Failed to write durable audit record to %q: %v\n", s.durablePath, wErr)
+	} else {
+		// Flush OS write buffers to disk to guarantee persistence across crashes
+		_ = f.Sync()
 	}
 	_ = f.Close()
+}
+
+// Close gracefully shuts down the audit spooler, flushing all queued records to durable storage.
+func (s *AuditSpooler) Close() {
+	if s.closed.CompareAndSwap(false, true) {
+		close(s.ch)
+		<-s.done
+	}
 }
 
 // DroppedCount returns the count of memory-buffer dropped/backpressured audit records.
@@ -309,4 +365,34 @@ func (s *AuditSpooler) GetRecords() []AuditRecord {
 	list := make([]AuditRecord, len(s.records))
 	copy(list, s.records)
 	return list
+}
+
+// RecoverAuditRecords reads back and decodes all audit records persisted to a durable JSON-lines log file.
+// Used during system startup or forensic restart recovery to reconstitute audit history.
+func RecoverAuditRecords(path string) ([]AuditRecord, error) {
+	if path == "" {
+		return nil, errors.New("durable audit log path cannot be empty")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // No previous audit history
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	var records []AuditRecord
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var rec AuditRecord
+		if err := json.Unmarshal(line, &rec); err == nil {
+			records = append(records, rec)
+		}
+	}
+	return records, scanner.Err()
 }

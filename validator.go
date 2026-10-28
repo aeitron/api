@@ -57,8 +57,8 @@ func ValidateSafeTargetURL(rawURL string) error {
 		return errors.New("missing hostname in target URL")
 	}
 
-	// In development mode, allow localhost for mock servers
-	isDev := strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "true") || strings.EqualFold(os.Getenv("AEITRON_ENV"), "development")
+	// In development mode, allow localhost for mock servers (strictly overridden by production mode)
+	isDev := IsDevelopmentEnv()
 	if isDev && (hostname == "127.0.0.1" || hostname == "localhost" || strings.HasPrefix(hostname, "127.")) {
 		return nil
 	}

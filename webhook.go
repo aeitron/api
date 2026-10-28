@@ -14,7 +14,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -268,7 +267,7 @@ func SafeDialContext(isDev bool) func(ctx context.Context, network, addr string)
 // 1. Rejects HTTP redirects to prevent open-redirect SSRF targeting internal/metadata services.
 // 2. Enforces connection-time DNS resolution and IP verification to block private, loopback, and cloud metadata IPs.
 func NewSafeWebhookClient(timeout time.Duration) *http.Client {
-	isDev := strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "true") || strings.EqualFold(os.Getenv("AEITRON_ENV"), "development")
+	isDev := IsDevelopmentEnv()
 
 	transport := &http.Transport{
 		MaxIdleConns:        100,
@@ -277,6 +276,7 @@ func NewSafeWebhookClient(timeout time.Duration) *http.Client {
 		DialContext:         SafeDialContext(isDev),
 		Proxy:               nil,
 		DialTLSContext:      nil,
+		DialTLS:             nil, // Explicitly clear legacy TLS dialer
 	}
 
 	return &http.Client{
@@ -313,8 +313,8 @@ func NewWebhookEngine(cfg WebhookConfig, metrics *MetricsCollector) *WebhookEngi
 		cfg.ClockSkewWindow = 5 * time.Minute
 	}
 
-	isDev := strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "true") || strings.EqualFold(os.Getenv("AEITRON_ENV"), "development")
-	isProd := strings.EqualFold(os.Getenv("AEITRON_ENV"), "production") || strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "false")
+	isDev := IsDevelopmentEnv()
+	isProd := IsProductionEnv()
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
@@ -330,8 +330,10 @@ func NewWebhookEngine(cfg WebhookConfig, metrics *MetricsCollector) *WebhookEngi
 			tr.DialContext = SafeDialContext(isDev)
 			// Prohibit unvalidated proxy routing that could bypass internal IP restrictions
 			tr.Proxy = nil
-			// Clear custom TLS dialer to guarantee all https:// requests invoke SafeDialContext
+			// Clear custom TLS dialers (both modern DialTLSContext and legacy DialTLS)
+			// to guarantee all https:// requests invoke SafeDialContext
 			tr.DialTLSContext = nil
+			tr.DialTLS = nil
 		} else if httpClient.Transport == nil {
 			httpClient.Transport = &http.Transport{
 				MaxIdleConns:        100,
@@ -340,6 +342,7 @@ func NewWebhookEngine(cfg WebhookConfig, metrics *MetricsCollector) *WebhookEngi
 				DialContext:         SafeDialContext(isDev),
 				Proxy:               nil,
 				DialTLSContext:      nil,
+				DialTLS:             nil,
 			}
 		} else if isProd {
 			// In production, unverified or non-standard custom transports that cannot enforce SafeDialContext
