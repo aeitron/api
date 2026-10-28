@@ -1,6 +1,7 @@
 package apigateway
 
 import (
+	"context"
 	"hash/fnv"
 	"math"
 	"sync"
@@ -22,9 +23,12 @@ type shard struct {
 	buckets map[string]*bucket
 }
 
-// TokenBucketLimiter provides lock-striped, concurrent token-bucket rate limiting.
+// TokenBucketLimiter provides lock-striped, concurrent token-bucket rate limiting
+// with optional distributed synchronization across cluster nodes.
 type TokenBucketLimiter struct {
-	shards [numShards]*shard
+	shards       [numShards]*shard
+	stateAdapter ClusterStateAdapter
+	mu           sync.RWMutex
 }
 
 // NewTokenBucketLimiter initializes a sharded token bucket rate limiter.
@@ -38,6 +42,20 @@ func NewTokenBucketLimiter() *TokenBucketLimiter {
 	return limiter
 }
 
+// SetStateAdapter configures the cluster state adapter for distributed multi-PoP rate limiting.
+func (l *TokenBucketLimiter) SetStateAdapter(adapter ClusterStateAdapter) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.stateAdapter = adapter
+}
+
+// StateAdapter returns the configured cluster state adapter.
+func (l *TokenBucketLimiter) StateAdapter() ClusterStateAdapter {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.stateAdapter
+}
+
 func (l *TokenBucketLimiter) getShard(key string) *shard {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
@@ -46,8 +64,30 @@ func (l *TokenBucketLimiter) getShard(key string) *shard {
 }
 
 // Allow evaluates if a request with the given key is permitted under rate and capacity.
-// Returns whether allowed, remaining tokens, and time to wait if limited.
+// When a distributed cluster state adapter is configured, it synchronizes atomically
+// with cluster nodes; otherwise (or on failure), it seamlessly evaluates local state.
 func (l *TokenBucketLimiter) Allow(key string, rate float64, capacity int) (bool, int, time.Duration) {
+	if rate <= 0 || capacity <= 0 {
+		return true, capacity, 0
+	}
+
+	l.mu.RLock()
+	adapter := l.stateAdapter
+	l.mu.RUnlock()
+
+	if adapter != nil && adapter.Name() != "memory" {
+		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		defer cancel()
+		allowed, remaining, retryAfter, err := adapter.RateLimitAllow(ctx, key, rate, capacity)
+		if err == nil {
+			return allowed, remaining, retryAfter
+		}
+	}
+
+	return l.allowLocal(key, rate, capacity)
+}
+
+func (l *TokenBucketLimiter) allowLocal(key string, rate float64, capacity int) (bool, int, time.Duration) {
 	if rate <= 0 || capacity <= 0 {
 		return true, capacity, 0
 	}

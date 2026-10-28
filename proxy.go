@@ -1,13 +1,9 @@
 package apigateway
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync"
@@ -113,91 +109,58 @@ func (cb *CircuitBreaker) ConsecutiveFails() int {
 	return cb.consecutiveFails
 }
 
-// UpstreamProxy encapsulates reverse proxying and circuit breaking for a specific upstream.
+// UpstreamProxy encapsulates load-balanced reverse proxying and circuit breaking for a specific upstream.
 type UpstreamProxy struct {
-	rule           RouteRule
-	targetURL      *url.URL
-	reverseProxy   *httputil.ReverseProxy
-	circuitBreaker *CircuitBreaker
+	rule RouteRule
+	pool *UpstreamPool
 }
 
-// NewUpstreamProxy creates an UpstreamProxy.
+// NewUpstreamProxy creates an UpstreamProxy supporting single or multiple load-balanced targets.
 func NewUpstreamProxy(rule RouteRule) (*UpstreamProxy, error) {
-	target, err := url.Parse(rule.UpstreamURL)
+	var rawURLs []string
+	if len(rule.UpstreamURLs) > 0 {
+		rawURLs = rule.UpstreamURLs
+	} else if rule.UpstreamURL != "" {
+		for _, part := range strings.Split(rule.UpstreamURL, ",") {
+			trimmed := strings.TrimSpace(part)
+			if trimmed != "" {
+				rawURLs = append(rawURLs, trimmed)
+			}
+		}
+	}
+
+	if len(rawURLs) == 0 {
+		return nil, fmt.Errorf("no upstream URLs specified for path '%s'", rule.PathPrefix)
+	}
+
+	var parsedURLs []*url.URL
+	for _, raw := range rawURLs {
+		if err := ValidateSafeUpstreamURL(raw); err != nil {
+			return nil, fmt.Errorf("unsafe upstream URL for route '%s': %w", rule.PathPrefix, err)
+		}
+		target, err := url.Parse(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid upstream URL '%s': %w", raw, err)
+		}
+		parsedURLs = append(parsedURLs, target)
+	}
+
+	pool, err := NewUpstreamPool(rule, parsedURLs)
 	if err != nil {
-		return nil, fmt.Errorf("invalid upstream URL '%s': %w", rule.UpstreamURL, err)
-	}
-
-	cb := NewCircuitBreaker(5, 5*time.Second)
-
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		MaxIdleConns:          1000,
-		MaxIdleConnsPerHost:   100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-	}
-
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.Transport = transport
-
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		req.Host = target.Host
-
-		// Apply RewritePrefix or StripPrefix
-		if rule.RewritePrefix != "" {
-			req.URL.Path = rule.RewritePrefix + strings.TrimPrefix(req.URL.Path, rule.PathPrefix)
-		} else if rule.StripPrefix {
-			req.URL.Path = strings.TrimPrefix(req.URL.Path, rule.PathPrefix)
-			if !strings.HasPrefix(req.URL.Path, "/") {
-				req.URL.Path = "/" + req.URL.Path
-			}
-		}
-
-		// Strip client spoofing attempts
-		req.Header.Del("X-Forwarded-Host")
-	}
-
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		cb.RecordResult(resp.StatusCode)
-		if resp.StatusCode == http.StatusOK && resp.Request != nil &&
-			(resp.Request.Method == http.MethodGet || resp.Request.Method == http.MethodHead) {
-			if resp.Header.Get("ETag") == "" && resp.Body != nil {
-				bodyBytes, err := io.ReadAll(resp.Body)
-				if err == nil {
-					_ = resp.Body.Close()
-					resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-					resp.Header.Set("ETag", GenerateETag(bodyBytes))
-				}
-			}
-		}
-		return nil
-	}
-
-	proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
-		cb.RecordResult(http.StatusBadGateway)
-		WriteBadGateway(w, req, fmt.Sprintf("upstream gateway error: %s", err.Error()))
+		return nil, err
 	}
 
 	return &UpstreamProxy{
-		rule:           rule,
-		targetURL:      target,
-		reverseProxy:   proxy,
-		circuitBreaker: cb,
+		rule: rule,
+		pool: pool,
 	}, nil
 }
 
 func (up *UpstreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request, ctx *TenantContext, reqID string) {
-	if !up.circuitBreaker.Allow() {
+	node, err := up.pool.Pick()
+	if err != nil {
 		w.Header().Set("Retry-After", "5")
-		WriteServiceUnavailable(w, r, "upstream service unavailable: circuit breaker is open")
+		WriteServiceUnavailable(w, r, "upstream service unavailable: no healthy backend nodes in pool")
 		return
 	}
 
@@ -220,16 +183,56 @@ func (up *UpstreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request, ctx *
 		r.Header.Set("X-RateLimit-Tier", ctx.Tier)
 	}
 	r.Header.Set("X-Request-ID", reqID)
+	r.Header.Set("X-Backend-Node", node.URLString())
+	w.Header().Set("X-Backend-Node", node.URLString())
 
-	up.reverseProxy.ServeHTTP(w, r)
+	// Ensure W3C distributed tracing context propagation to upstream
+	if tp := r.Header.Get("traceparent"); tp != "" {
+		r.Header.Set("traceparent", tp)
+	}
+	if ts := r.Header.Get("tracestate"); ts != "" {
+		r.Header.Set("tracestate", ts)
+	}
+
+	node.activeConns.Add(1)
+	node.totalRequests.Add(1)
+	defer node.activeConns.Add(-1)
+
+	node.reverseProxy.ServeHTTP(w, r)
 }
 
-// UpstreamURL returns the configured upstream target URL string.
+// UpstreamURL returns the configured upstream target URL string (primary node).
 func (up *UpstreamProxy) UpstreamURL() string {
+	if up.pool != nil && len(up.pool.nodes) > 0 {
+		return up.pool.nodes[0].URLString()
+	}
 	return up.rule.UpstreamURL
 }
 
-// CircuitBreaker returns the proxy circuit breaker instance.
+// CircuitBreaker returns the proxy circuit breaker instance (primary node).
 func (up *UpstreamProxy) CircuitBreaker() *CircuitBreaker {
-	return up.circuitBreaker
+	if up.pool != nil && len(up.pool.nodes) > 0 {
+		return up.pool.nodes[0].CircuitBreaker()
+	}
+	return nil
+}
+
+// Pool returns the underlying load-balanced upstream pool.
+func (up *UpstreamProxy) Pool() *UpstreamPool {
+	return up.pool
+}
+
+// Nodes returns all backend nodes in the pool.
+func (up *UpstreamProxy) Nodes() []*UpstreamNode {
+	if up.pool == nil {
+		return nil
+	}
+	return up.pool.nodes
+}
+
+// Close gracefully shuts down background health check loops for this proxy.
+func (up *UpstreamProxy) Close() {
+	if up.pool != nil {
+		up.pool.Close()
+	}
 }

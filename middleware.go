@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -58,6 +59,12 @@ func (rw *ResponseWriterWrapper) Write(b []byte) (int, error) {
 	return n, err
 }
 
+func (rw *ResponseWriterWrapper) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // ApplySecurityHeaders adds standard defensive headers to the response.
 func ApplySecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -66,16 +73,81 @@ func ApplySecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 }
 
-// HandleCORS processes preflight OPTIONS or attaches CORS response headers.
-func HandleCORS(w http.ResponseWriter, r *http.Request) bool {
-	origin := r.Header.Get("Origin")
+var defaultAllowedOrigins = []string{
+	"https://aeitron.com",
+	"https://app.aeitron.com",
+	"https://dashboard.aeitron.com",
+	"https://developer.aeitron.com",
+	"https://api.aeitron.com",
+}
+
+// IsOriginAllowed checks whether an incoming Origin header matches the configured allowlist.
+func IsOriginAllowed(origin string) bool {
 	if origin == "" {
-		origin = "*"
+		return false
 	}
+
+	// 1. Check custom configured origins from environment
+	if custom := os.Getenv("AEITRON_CORS_ALLOWED_ORIGINS"); custom != "" {
+		for _, o := range strings.Split(custom, ",") {
+			trimmed := strings.TrimSpace(o)
+			if trimmed == "*" || strings.EqualFold(trimmed, origin) {
+				return true
+			}
+		}
+	}
+
+	// 2. Check canonical Aeitron production domains and wildcard subdomains
+	originLower := strings.ToLower(origin)
+	for _, allowed := range defaultAllowedOrigins {
+		if strings.EqualFold(allowed, originLower) {
+			return true
+		}
+	}
+	if strings.HasSuffix(originLower, ".aeitron.com") || strings.HasSuffix(originLower, ".aeitron.io") {
+		return true
+	}
+
+	// 3. In development mode, allow localhost and 127.0.0.1 on any port
+	isDev := !strings.EqualFold(os.Getenv("AEITRON_ENV"), "production") || strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "true")
+	if isDev {
+		if strings.HasPrefix(originLower, "http://localhost") || strings.HasPrefix(originLower, "http://127.0.0.1") ||
+			strings.HasPrefix(originLower, "https://localhost") || strings.HasPrefix(originLower, "https://127.0.0.1") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// HandleCORS processes preflight OPTIONS or attaches CORS response headers according to strict origin allowlist.
+func HandleCORS(w http.ResponseWriter, r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+
+	// Non-CORS request (e.g. backend curl, CLI, SDK)
+	if origin == "" {
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return true
+		}
+		return false
+	}
+
+	allowed := IsOriginAllowed(origin)
+	if !allowed {
+		if r.Method == http.MethodOptions {
+			http.Error(w, "CORS origin not permitted", http.StatusForbidden)
+			return true
+		}
+		// For regular requests, do NOT reflect untrusted origin
+		return false
+	}
+
 	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Add("Vary", "Origin")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization, X-API-Key, Content-Type, X-Request-ID, Accept, Idempotency-Key, X-Idempotency-Key, If-None-Match, If-Modified-Since")
-	w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Idempotent-Replayed, ETag, X-Cache, Age")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, X-API-Key, Content-Type, X-Request-ID, Accept, Idempotency-Key, X-Idempotency-Key, If-None-Match, If-Modified-Since, Aeitron-Version, X-Aeitron-Version, API-Version")
+	w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Idempotent-Replayed, ETag, X-Cache, Age, Aeitron-Version, X-Aeitron-Deprecation-Date, Sunset, Link, X-Aeitron-Warning")
 	w.Header().Set("Access-Control-Max-Age", "86400")
 
 	if r.Method == http.MethodOptions {

@@ -1,11 +1,21 @@
 package apigateway
 
 import (
+	"bufio"
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1426,4 +1436,2595 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func TestAPIGateway_LoadBalancer_RoundRobin(t *testing.T) {
+	var hits [3]atomic.Int32
+	servers := make([]*httptest.Server, 3)
+	urls := make([]string, 3)
+	for i := 0; i < 3; i++ {
+		idx := i
+		servers[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits[idx].Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"node": %d}`, idx)))
+		}))
+		defer servers[i].Close()
+		urls[i] = servers[i].URL
+	}
+
+	gw := NewAPIGateway("test-secret-32-bytes-long-key-xyz")
+	defer gw.Close()
+
+	err := gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/multi-rr",
+		UpstreamURLs:   urls,
+		LoadBalancer:   AlgorithmRoundRobin,
+		AllowAnonymous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to register multi-rr route: %v", err)
+	}
+
+	// Dispatch 9 requests sequentially
+	for i := 0; i < 9; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/v1/multi-rr/test", nil)
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d failed with status %d: %s", i, rec.Code, rec.Body.String())
+		}
+
+		backendHeader := rec.Header().Get("X-Backend-Node")
+		if backendHeader == "" {
+			t.Fatalf("expected X-Backend-Node header in response")
+		}
+	}
+
+	// Each node should receive exactly 3 requests (3 + 3 + 3 = 9)
+	for i := 0; i < 3; i++ {
+		if hits[i].Load() != 3 {
+			t.Fatalf("node %d expected 3 hits, got %d", i, hits[i].Load())
+		}
+	}
+}
+
+func TestAPIGateway_LoadBalancer_LeastConnections(t *testing.T) {
+	var node0Hits, node1Hits atomic.Int32
+	node0Block := make(chan struct{})
+	node0Started := make(chan struct{})
+	defer func() {
+		select {
+		case <-node0Block:
+		default:
+			close(node0Block)
+		}
+	}()
+
+	// Node 0 blocks on first request to simulate heavy/congested processing
+	server0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		node0Hits.Add(1)
+		select {
+		case <-node0Started:
+		default:
+			close(node0Started)
+		}
+		<-node0Block // wait until released
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"node": 0}`))
+	}))
+	defer server0.Close()
+
+	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		node1Hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"node": 1}`))
+	}))
+	defer server1.Close()
+
+	gw := NewAPIGateway("test-secret-32-bytes-long-key-xyz")
+	defer gw.Close()
+
+	err := gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/least-conn",
+		UpstreamURLs:   []string{server0.URL, server1.URL},
+		LoadBalancer:   AlgorithmLeastConn,
+		AllowAnonymous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to register least-conn route: %v", err)
+	}
+
+	// Launch long-running request on Node 0 in background
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/v1/least-conn/slow", nil)
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+	}()
+
+	// Wait until Node 0 is actively serving (active connection count > 0)
+	<-node0Started
+
+	// Now send 5 subsequent fast requests
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/v1/least-conn/fast", nil)
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("fast request %d failed: %d", i, rec.Code)
+		}
+		if rec.Header().Get("X-Backend-Node") != server1.URL {
+			t.Fatalf("expected request %d to be routed to server1 (least connections), got %s", i, rec.Header().Get("X-Backend-Node"))
+		}
+	}
+
+	// Unblock Node 0
+	close(node0Block)
+	time.Sleep(20 * time.Millisecond)
+
+	if node1Hits.Load() != 5 {
+		t.Fatalf("expected node1 to handle 5 fast requests, got %d", node1Hits.Load())
+	}
+	if node0Hits.Load() != 1 {
+		t.Fatalf("expected node0 to handle 1 slow request, got %d", node0Hits.Load())
+	}
+}
+
+func TestAPIGateway_ActiveHealthCheck_PruningAndRecovery(t *testing.T) {
+	var node0Healthy atomic.Bool
+	node0Healthy.Store(true)
+
+	server0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			if node0Healthy.Load() {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"status":"ok"}`))
+			} else {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"status":"down"}`))
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"node": 0}`))
+	}))
+	defer server0.Close()
+
+	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"node": 1}`))
+	}))
+	defer server1.Close()
+
+	gw := NewAPIGateway("test-secret-32-bytes-long-key-xyz")
+	defer gw.Close()
+
+	err := gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/resilient",
+		UpstreamURLs:   []string{server0.URL, server1.URL},
+		LoadBalancer:   AlgorithmRoundRobin,
+		AllowAnonymous: true,
+		HealthCheck: HealthCheckConfig{
+			Enabled:            true,
+			Path:               "/healthz",
+			Interval:           20 * time.Millisecond,
+			Timeout:            100 * time.Millisecond,
+			UnhealthyThreshold: 2,
+			HealthyThreshold:   2,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to register resilient route: %v", err)
+	}
+
+	proxy := gw.Proxies()["/v1/resilient"]
+	pool := proxy.Pool()
+
+	// Initial probe: both healthy
+	pool.ProbeAll()
+	if len(pool.HealthyNodes()) != 2 {
+		t.Fatalf("expected 2 healthy nodes initially, got %d", len(pool.HealthyNodes()))
+	}
+
+	// 1. Simulate Node 0 failure
+	node0Healthy.Store(false)
+	// Probe twice to exceed UnhealthyThreshold (2)
+	pool.ProbeAll()
+	pool.ProbeAll()
+
+	if len(pool.HealthyNodes()) != 1 {
+		t.Fatalf("expected 1 healthy node after failure, got %d", len(pool.HealthyNodes()))
+	}
+	if pool.HealthyNodes()[0].URLString() != server1.URL {
+		t.Fatalf("expected server1 to be the only healthy node")
+	}
+
+	// Send 4 requests: all 4 must seamlessly route to server1 with 0 user errors
+	for i := 0; i < 4; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/v1/resilient/data", nil)
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d failed: %d", i, rec.Code)
+		}
+		if rec.Header().Get("X-Backend-Node") != server1.URL {
+			t.Fatalf("expected traffic routed exclusively to server1, got %s", rec.Header().Get("X-Backend-Node"))
+		}
+	}
+
+	// 2. Simulate Node 0 recovery
+	node0Healthy.Store(true)
+	// Probe twice to exceed HealthyThreshold (2)
+	pool.ProbeAll()
+	pool.ProbeAll()
+
+	if len(pool.HealthyNodes()) != 2 {
+		t.Fatalf("expected 2 healthy nodes after recovery, got %d", len(pool.HealthyNodes()))
+	}
+}
+
+func TestAPIGateway_LoadBalancer_AllNodesDownFailClosed(t *testing.T) {
+	server0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server0.Close()
+
+	gw := NewAPIGateway("test-secret-32-bytes-long-key-xyz")
+	defer gw.Close()
+
+	err := gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/all-down",
+		UpstreamURLs:   []string{server0.URL},
+		AllowAnonymous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to register route: %v", err)
+	}
+
+	// Manually mark node unhealthy and trip circuit breaker
+	proxy := gw.Proxies()["/v1/all-down"]
+	proxy.Pool().Nodes()[0].SetHealthy(false)
+	for i := 0; i < 6; i++ {
+		proxy.Pool().Nodes()[0].CircuitBreaker().RecordResult(503)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/all-down/check", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable when all nodes down, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "no healthy backend nodes in pool") {
+		t.Fatalf("unexpected error response: %s", rec.Body.String())
+	}
+}
+
+func TestAPIGateway_UpstreamInspectionEndpoint(t *testing.T) {
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s1.Close()
+
+	s2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s2.Close()
+
+	gw := NewAPIGateway("test-secret-32-bytes-long-key-xyz")
+	defer gw.Close()
+
+	err := gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/inspected",
+		UpstreamURLs:   []string{s1.URL, s2.URL},
+		LoadBalancer:   AlgorithmLeastConn,
+		AllowAnonymous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to register route: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/gateway/upstreams", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/gateway/upstreams, got %d", rec.Code)
+	}
+
+	var resp struct {
+		Upstreams map[string]struct {
+			Algorithm    string `json:"algorithm"`
+			TotalNodes   int    `json:"total_nodes"`
+			HealthyNodes int    `json:"healthy_nodes"`
+			Nodes        []struct {
+				URL     string `json:"url"`
+				Healthy bool   `json:"healthy"`
+			} `json:"nodes"`
+		} `json:"upstreams"`
+	}
+
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse upstreams JSON: %v", err)
+	}
+
+	pool, exists := resp.Upstreams["/v1/inspected"]
+	if !exists {
+		t.Fatalf("missing /v1/inspected in upstreams endpoint response")
+	}
+	if pool.Algorithm != AlgorithmLeastConn {
+		t.Fatalf("expected algorithm least_conn, got %s", pool.Algorithm)
+	}
+	if pool.TotalNodes != 2 || pool.HealthyNodes != 2 {
+		t.Fatalf("expected 2 total and 2 healthy nodes, got %d / %d", pool.TotalNodes, pool.HealthyNodes)
+	}
+}
+
+func TestAPIGateway_PrometheusMetrics_UpstreamNodeHealth(t *testing.T) {
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s1.Close()
+
+	gw := NewAPIGateway("test-secret-32-bytes-long-key-xyz")
+	defer gw.Close()
+
+	err := gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/metrics-nodes",
+		UpstreamURLs:   []string{s1.URL},
+		AllowAnonymous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to register route: %v", err)
+	}
+
+	// Trigger request to increment requests count
+	req := httptest.NewRequest(http.MethodGet, "/v1/metrics-nodes/ping", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	// Scrape /metrics
+	reqM := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	recM := httptest.NewRecorder()
+	gw.ServeHTTP(recM, reqM)
+
+	out := recM.Body.String()
+	if !strings.Contains(out, fmt.Sprintf(`aeitron_api_upstream_node_health{route="/v1/metrics-nodes",node="%s"} 1`, s1.URL)) {
+		t.Fatalf("expected upstream node health in Prometheus metrics, got:\n%s", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf(`aeitron_api_upstream_node_active_connections{route="/v1/metrics-nodes",node="%s"} 0`, s1.URL)) {
+		t.Fatalf("expected upstream node active connections in Prometheus metrics, got:\n%s", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf(`aeitron_api_upstream_node_requests_total{route="/v1/metrics-nodes",node="%s"} 1`, s1.URL)) {
+		t.Fatalf("expected upstream node requests total in Prometheus metrics, got:\n%s", out)
+	}
+}
+
+func TestAPIGateway_Compression_GzipStreaming(t *testing.T) {
+	// Create large JSON payload (> 512 bytes)
+	type CatalogItem struct {
+		ID          string  `json:"id"`
+		Name        string  `json:"name"`
+		Description string  `json:"description"`
+		Price       float64 `json:"price"`
+	}
+	var items []CatalogItem
+	for i := 1; i <= 50; i++ {
+		items = append(items, CatalogItem{
+			ID:          fmt.Sprintf("item-%04d", i),
+			Name:        fmt.Sprintf("High-Performance Edge Gateway Appliance Node %d", i),
+			Description: "Enterprise-grade RFC 9111 edge caching, intelligent routing, and zero-trust WAF inspection.",
+			Price:       299.99 * float64(i),
+		})
+	}
+	rawBytes, err := json.Marshal(items)
+	if err != nil {
+		t.Fatalf("failed to marshal items: %v", err)
+	}
+	if len(rawBytes) < 2000 {
+		t.Fatalf("test payload should be substantial, got %d bytes", len(rawBytes))
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(rawBytes)
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("compression-test-secret-32-bytes")
+	defer gw.Close()
+
+	err = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/compress-test",
+		UpstreamURLs:   []string{upstream.URL},
+		AllowAnonymous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to register route: %v", err)
+	}
+
+	// 1. Client requests with Accept-Encoding: gzip
+	req := httptest.NewRequest(http.MethodGet, "/v1/compress-test/items", nil)
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Check response headers
+	encoding := rec.Header().Get("Content-Encoding")
+	if encoding != "gzip" {
+		t.Fatalf("expected Content-Encoding: gzip, got %q", encoding)
+	}
+	vary := rec.Header().Get("Vary")
+	if !strings.Contains(vary, "Accept-Encoding") {
+		t.Errorf("expected Vary header to contain Accept-Encoding, got %q", vary)
+	}
+
+	// Verify compressed payload size is substantially smaller (high bandwidth savings)
+	compressedSize := rec.Body.Len()
+	if compressedSize >= len(rawBytes) {
+		t.Fatalf("expected compression to reduce size: uncompressed=%d, compressed=%d", len(rawBytes), compressedSize)
+	}
+	ratio := float64(len(rawBytes)-compressedSize) / float64(len(rawBytes)) * 100
+	if ratio < 50.0 {
+		t.Errorf("expected >= 50%% compression ratio on JSON, got %.2f%%", ratio)
+	}
+
+	// Decompress and verify content integrity
+	gzReader, err := gzip.NewReader(rec.Body)
+	if err != nil {
+		t.Fatalf("failed to create gzip reader: %v", err)
+	}
+	defer gzReader.Close()
+
+	decompressed, err := io.ReadAll(gzReader)
+	if err != nil {
+		t.Fatalf("failed to decompress gzip stream: %v", err)
+	}
+
+	if string(decompressed) != string(rawBytes) {
+		t.Fatalf("decompressed payload mismatch! len decomp=%d, len raw=%d", len(decompressed), len(rawBytes))
+	}
+}
+
+func TestAPIGateway_Compression_Deflate(t *testing.T) {
+	largeData := strings.Repeat("aeitron-cloud-edge-infrastructure-gateway-deflate-test-line\n", 40)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(largeData))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("compression-test-secret-32-bytes")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/deflate-test",
+		UpstreamURLs:   []string{upstream.URL},
+		AllowAnonymous: true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/deflate-test/data", nil)
+	req.Header.Set("Accept-Encoding", "deflate")
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	if rec.Header().Get("Content-Encoding") != "deflate" {
+		t.Fatalf("expected Content-Encoding: deflate, got %q", rec.Header().Get("Content-Encoding"))
+	}
+
+	flReader := flate.NewReader(rec.Body)
+	defer flReader.Close()
+	decompressed, err := io.ReadAll(flReader)
+	if err != nil {
+		t.Fatalf("failed to decompress flate stream: %v", err)
+	}
+	if string(decompressed) != largeData {
+		t.Fatalf("decompressed deflate data mismatch")
+	}
+}
+
+func TestAPIGateway_Compression_SmallPayloadIgnored(t *testing.T) {
+	// Payload smaller than 512 bytes must NOT be compressed
+	smallJSON := `{"status":"ok","msg":"tiny payload"}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(smallJSON))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("compression-test-secret-32-bytes")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/small-test",
+		UpstreamURLs:   []string{upstream.URL},
+		AllowAnonymous: true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/small-test/status", nil)
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	if enc := rec.Header().Get("Content-Encoding"); enc != "" {
+		t.Fatalf("expected no Content-Encoding on tiny payload (< 512 bytes), got %q", enc)
+	}
+	if rec.Body.String() != smallJSON {
+		t.Fatalf("expected raw body %q, got %q", smallJSON, rec.Body.String())
+	}
+}
+
+func TestAPIGateway_Compression_IneligibleContentTypeIgnored(t *testing.T) {
+	// Binary payload (application/octet-stream) should not be compressed
+	binaryData := make([]byte, 2048)
+	for i := range binaryData {
+		binaryData[i] = byte(i % 256)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(binaryData)
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("compression-test-secret-32-bytes")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/binary-test",
+		UpstreamURLs:   []string{upstream.URL},
+		AllowAnonymous: true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/binary-test/blob", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	if enc := rec.Header().Get("Content-Encoding"); enc != "" {
+		t.Fatalf("expected no Content-Encoding on application/octet-stream, got %q", enc)
+	}
+	if rec.Body.Len() != len(binaryData) {
+		t.Fatalf("expected raw bytes length %d, got %d", len(binaryData), rec.Body.Len())
+	}
+}
+
+func TestAPIGateway_Compression_PrecompressedCacheHit(t *testing.T) {
+	upstreamHits := int32(0)
+	largeCatalogJSON := fmt.Sprintf(`{"catalog":[%s]}`, strings.Repeat(`{"sku":"AEI-EDGE-100","name":"UltraFast Anycast POP"},`, 25))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "public, s-maxage=60")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(largeCatalogJSON))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("compression-test-secret-32-bytes")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/cached-catalog",
+		UpstreamURLs:   []string{upstream.URL},
+		AllowAnonymous: true,
+		CacheTTL:       60 * time.Second,
+	})
+
+	// 1. First request primes cache (MISS -> stored with precompressed GzipBody)
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/cached-catalog/products", nil)
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec1.Code)
+	}
+	if atomic.LoadInt32(&upstreamHits) != 1 {
+		t.Fatalf("expected 1 upstream hit, got %d", upstreamHits)
+	}
+
+	// 2. Second request with Accept-Encoding: gzip (Cache HIT serving precompressed bytes directly)
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/cached-catalog/products", nil)
+	req2.Header.Set("Accept-Encoding", "gzip, deflate")
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on cache hit, got %d", rec2.Code)
+	}
+	if rec2.Header().Get("X-Cache") != "HIT" {
+		t.Errorf("expected X-Cache: HIT, got %s", rec2.Header().Get("X-Cache"))
+	}
+	if rec2.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("expected Content-Encoding: gzip on cache hit, got %q", rec2.Header().Get("Content-Encoding"))
+	}
+	if atomic.LoadInt32(&upstreamHits) != 1 {
+		t.Fatalf("upstream should not be hit on cache hit, got %d", upstreamHits)
+	}
+
+	// Decompress and verify
+	gzReader, err := gzip.NewReader(rec2.Body)
+	if err != nil {
+		t.Fatalf("failed to create gzip reader on cache hit: %v", err)
+	}
+	decompressed, err := io.ReadAll(gzReader)
+	_ = gzReader.Close()
+	if err != nil {
+		t.Fatalf("failed to decompress cache hit body: %v", err)
+	}
+	if string(decompressed) != largeCatalogJSON {
+		t.Fatalf("cache hit body mismatch")
+	}
+
+	// 3. Third request with Accept-Encoding: identity (Cache HIT serving uncompressed bytes)
+	req3 := httptest.NewRequest(http.MethodGet, "/v1/cached-catalog/products", nil)
+	req3.Header.Set("Accept-Encoding", "identity")
+	rec3 := httptest.NewRecorder()
+	gw.ServeHTTP(rec3, req3)
+
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec3.Code)
+	}
+	if rec3.Header().Get("X-Cache") != "HIT" {
+		t.Errorf("expected X-Cache: HIT, got %s", rec3.Header().Get("X-Cache"))
+	}
+	if enc := rec3.Header().Get("Content-Encoding"); enc != "" {
+		t.Fatalf("expected no Content-Encoding for client with identity encoding, got %q", enc)
+	}
+	if rec3.Body.String() != largeCatalogJSON {
+		t.Fatalf("uncompressed cache hit body mismatch")
+	}
+	if atomic.LoadInt32(&upstreamHits) != 1 {
+		t.Fatalf("upstream should still have only 1 hit, got %d", upstreamHits)
+	}
+}
+
+func TestAPIGateway_Compression_PrometheusMetrics(t *testing.T) {
+	gw := NewAPIGateway("compression-test-secret-32-bytes")
+	defer gw.Close()
+
+	// Record sample compression metrics
+	gw.metrics.RecordCompression(5000, 1200, "gzip")
+	gw.metrics.RecordCompression(3000, 900, "deflate")
+
+	if gw.metrics.CompressionSavings() != (5000-1200)+(3000-900) {
+		t.Fatalf("expected savings %d, got %d", (5000-1200)+(3000-900), gw.metrics.CompressionSavings())
+	}
+
+	reqM := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	recM := httptest.NewRecorder()
+	gw.ServeHTTP(recM, reqM)
+
+	out := recM.Body.String()
+	if !strings.Contains(out, `aeitron_api_compressed_responses_total{encoding="gzip"} 1`) {
+		t.Fatalf("expected gzip compression counter in Prometheus metrics, got:\n%s", out)
+	}
+	if !strings.Contains(out, `aeitron_api_compressed_responses_total{encoding="deflate"} 1`) {
+		t.Fatalf("expected deflate compression counter in Prometheus metrics, got:\n%s", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf(`aeitron_api_compression_savings_bytes_total %d`, (5000-1200)+(3000-900))) {
+		t.Fatalf("expected compression savings in Prometheus metrics, got:\n%s", out)
+	}
+}
+
+func TestWebhook_HMACSigningAndVerification(t *testing.T) {
+	signer := NewWebhookSigner(5 * time.Minute)
+	secret := "whsec_test_secret_key_1234567890abcdef"
+	payload := []byte(`{"id":"evt_1","type":"deployment.succeeded","tenant_id":"tenant_corp"}`)
+	now := time.Now().UTC()
+
+	sigHeader, tsStr := signer.Sign(secret, payload, now)
+	if !strings.HasPrefix(sigHeader, "sha256=") {
+		t.Fatalf("expected sha256= prefix in signature header, got %s", sigHeader)
+	}
+
+	// 1. Valid verification
+	if err := signer.Verify(secret, payload, sigHeader, tsStr); err != nil {
+		t.Fatalf("expected signature verification to pass, got error: %v", err)
+	}
+
+	// 2. Tampered payload
+	tamperedPayload := []byte(`{"id":"evt_1","type":"deployment.failed","tenant_id":"tenant_corp"}`)
+	if err := signer.Verify(secret, tamperedPayload, sigHeader, tsStr); err == nil {
+		t.Fatal("expected signature verification to fail on tampered payload, but succeeded")
+	}
+
+	// 3. Wrong secret
+	if err := signer.Verify("whsec_wrong_secret", payload, sigHeader, tsStr); err == nil {
+		t.Fatal("expected signature verification to fail on wrong secret, but succeeded")
+	}
+
+	// 4. Clock skew exceeding tolerance (> 5 min)
+	oldTime := now.Add(-10 * time.Minute)
+	_, oldTsStr := signer.Sign(secret, payload, oldTime)
+	if err := signer.Verify(secret, payload, sigHeader, oldTsStr); err == nil {
+		t.Fatal("expected clock skew rejection for 10-minute-old timestamp, but succeeded")
+	}
+}
+
+func TestWebhook_SubscriptionManagement(t *testing.T) {
+	gw := NewAPIGateway("test-secret-32-bytes")
+	defer gw.Close()
+
+	// 1. Reject unsafe URL (SSRF defense against cloud metadata IP)
+	subReqJSON := `{"url":"http://169.254.169.254/latest/meta-data","events":["deployment.*"]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks/subscriptions", strings.NewReader(subReqJSON))
+	req.Header.Set("X-Tenant-ID", "tenant_alpha")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for SSRF cloud metadata URL, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	// 2. Register valid webhook subscription
+	validSubJSON := `{"url":"https://example.com/webhooks","events":["deployment.*","invoice.paid"]}`
+	req = httptest.NewRequest(http.MethodPost, "/v1/webhooks/subscriptions", strings.NewReader(validSubJSON))
+	req.Header.Set("X-Tenant-ID", "tenant_alpha")
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for valid subscription, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	var createResp struct {
+		Subscription WebhookSubscription `json:"subscription"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &createResp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if !strings.HasPrefix(createResp.Subscription.ID, "sub_") {
+		t.Fatalf("expected sub_ prefix for subscription ID, got %s", createResp.Subscription.ID)
+	}
+	if !strings.HasPrefix(createResp.Subscription.Secret, "whsec_") {
+		t.Fatalf("expected whsec_ prefix for auto-generated secret, got %s", createResp.Subscription.Secret)
+	}
+	subID := createResp.Subscription.ID
+
+	// 3. Retrieve subscription by ID
+	req = httptest.NewRequest(http.MethodGet, "/v1/webhooks/subscriptions/"+subID, nil)
+	req.Header.Set("X-Tenant-ID", "tenant_alpha")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK retrieving subscription, got %d", rec.Code)
+	}
+
+	// 4. List subscriptions
+	req = httptest.NewRequest(http.MethodGet, "/v1/webhooks/subscriptions", nil)
+	req.Header.Set("X-Tenant-ID", "tenant_alpha")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK listing subscriptions, got %d", rec.Code)
+	}
+	var listResp struct {
+		Subscriptions []WebhookSubscription `json:"subscriptions"`
+		Count         int                   `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("failed to parse subscriptions list: %v", err)
+	}
+	if listResp.Count != 1 || len(listResp.Subscriptions) != 1 {
+		t.Fatalf("expected 1 subscription, got count=%d len=%d", listResp.Count, len(listResp.Subscriptions))
+	}
+
+	// 5. Delete subscription
+	req = httptest.NewRequest(http.MethodDelete, "/v1/webhooks/subscriptions/"+subID, nil)
+	req.Header.Set("X-Tenant-ID", "tenant_alpha")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK deleting subscription, got %d", rec.Code)
+	}
+
+	// 6. Verify deleted (404)
+	req = httptest.NewRequest(http.MethodGet, "/v1/webhooks/subscriptions/"+subID, nil)
+	req.Header.Set("X-Tenant-ID", "tenant_alpha")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found after deletion, got %d", rec.Code)
+	}
+}
+
+func TestWebhook_AsynchronousDelivery(t *testing.T) {
+	t.Setenv("AEITRON_DEV_MODE", "true")
+	var receivedSig, receivedTs, receivedDelID, receivedEvtType, receivedUA string
+	var receivedPayload []byte
+	receivedCh := make(chan struct{}, 1)
+
+	webhookListener := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedSig = r.Header.Get("X-Aeitron-Signature")
+		receivedTs = r.Header.Get("X-Aeitron-Timestamp")
+		receivedDelID = r.Header.Get("X-Aeitron-Delivery-ID")
+		receivedEvtType = r.Header.Get("X-Aeitron-Event-Type")
+		receivedUA = r.Header.Get("User-Agent")
+		receivedPayload, _ = io.ReadAll(r.Body)
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"received":true}`))
+		select {
+		case receivedCh <- struct{}{}:
+		default:
+		}
+	}))
+	defer webhookListener.Close()
+
+	gw := NewAPIGateway("test-secret-32-bytes")
+	defer gw.Close()
+
+	// Configure fast engine for test
+	cfg := WebhookConfig{
+		MaxRetries:        3,
+		InitialBackoff:    10 * time.Millisecond,
+		BackoffMultiplier: 2.0,
+		HTTPTimeout:       2 * time.Second,
+		Workers:           2,
+		QueueSize:         100,
+	}
+	engine := NewWebhookEngine(cfg, gw.Metrics())
+	gw.SetWebhookEngine(engine)
+
+	// Create subscription pointing to mock webhook listener
+	sub, err := engine.CreateSubscription("tenant_beta", CreateSubscriptionRequest{
+		URL:    webhookListener.URL,
+		Events: []string{"deployment.*"},
+		Secret: "whsec_custom_secret_1234567890abcdef",
+	})
+	if err != nil {
+		t.Fatalf("failed to create subscription: %v", err)
+	}
+
+	// Dispatch event via API
+	dispatchJSON := `{
+		"type": "deployment.succeeded",
+		"data": { "service": "edge-router", "version": "v2.4.1" }
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks/dispatch", strings.NewReader(dispatchJSON))
+	req.Header.Set("X-Tenant-ID", "tenant_beta")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted on dispatch, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	// Wait for listener to receive the webhook
+	select {
+	case <-receivedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for webhook listener to receive delivery")
+	}
+
+	// Verify headers
+	if !strings.HasPrefix(receivedSig, "sha256=") {
+		t.Fatalf("expected sha256= prefix in signature, got %s", receivedSig)
+	}
+	if receivedTs == "" {
+		t.Fatal("expected timestamp header")
+	}
+	if !strings.HasPrefix(receivedDelID, "del_") {
+		t.Fatalf("expected del_ prefix in delivery ID, got %s", receivedDelID)
+	}
+	if receivedEvtType != "deployment.succeeded" {
+		t.Fatalf("expected event type deployment.succeeded, got %s", receivedEvtType)
+	}
+	if !strings.Contains(receivedUA, "Aeitron-Webhook-Delivery") {
+		t.Fatalf("expected User-Agent Aeitron-Webhook-Delivery, got %s", receivedUA)
+	}
+
+	// Verify signature using the engine signer
+	if err := engine.Signer().Verify(sub.Secret, receivedPayload, receivedSig, receivedTs); err != nil {
+		t.Fatalf("signature verification failed on received payload: %v", err)
+	}
+
+	// Wait for worker to finish recording success status
+	engine.WaitIdle(1 * time.Second)
+
+	// Check delivery history via API
+	req = httptest.NewRequest(http.MethodGet, "/v1/webhooks/deliveries", nil)
+	req.Header.Set("X-Tenant-ID", "tenant_beta")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK retrieving deliveries, got %d", rec.Code)
+	}
+	var delResp struct {
+		Deliveries []WebhookDelivery `json:"deliveries"`
+		Count      int               `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &delResp); err != nil {
+		t.Fatalf("failed to decode deliveries: %v", err)
+	}
+	if delResp.Count != 1 || delResp.Deliveries[0].Status != "success" {
+		t.Fatalf("expected 1 delivery with status success, got count=%d status=%s", delResp.Count, delResp.Deliveries[0].Status)
+	}
+}
+
+func TestWebhook_ExponentialBackoffRetry(t *testing.T) {
+	t.Setenv("AEITRON_DEV_MODE", "true")
+	attempts := int32(0)
+	doneCh := make(chan struct{}, 1)
+
+	retryListener := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		att := atomic.AddInt32(&attempts, 1)
+		if att < 3 {
+			// Fail first two attempts with HTTP 500
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"temporary error"}`))
+			return
+		}
+		// Succeed on 3rd attempt
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"recovered"}`))
+		select {
+		case doneCh <- struct{}{}:
+		default:
+		}
+	}))
+	defer retryListener.Close()
+
+	gw := NewAPIGateway("test-secret-32-bytes")
+	defer gw.Close()
+
+	// Short backoff for fast deterministic test
+	cfg := WebhookConfig{
+		MaxRetries:        3,
+		InitialBackoff:    15 * time.Millisecond,
+		BackoffMultiplier: 2.0,
+		HTTPTimeout:       1 * time.Second,
+		Workers:           2,
+		QueueSize:         100,
+	}
+	engine := NewWebhookEngine(cfg, gw.Metrics())
+	gw.SetWebhookEngine(engine)
+
+	_, err := engine.CreateSubscription("tenant_retry", CreateSubscriptionRequest{
+		URL:    retryListener.URL,
+		Events: []string{"invoice.paid"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create subscription: %v", err)
+	}
+
+	_, err = engine.Dispatch(WebhookEvent{
+		Type:     "invoice.paid",
+		TenantID: "tenant_retry",
+		Data:     []byte(`{"invoice_id":"inv_999","amount":5000}`),
+	})
+	if err != nil {
+		t.Fatalf("failed to dispatch event: %v", err)
+	}
+
+	// Wait for 3rd attempt to succeed
+	select {
+	case <-doneCh:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for retries, completed attempts=%d", atomic.LoadInt32(&attempts))
+	}
+
+	if atomic.LoadInt32(&attempts) != 3 {
+		t.Fatalf("expected exactly 3 attempts (2 retries), got %d", attempts)
+	}
+
+	// Allow delivery state update to flush
+	engine.WaitIdle(1 * time.Second)
+
+	deliveries := engine.ListDeliveries("tenant_retry")
+	if len(deliveries) != 1 {
+		t.Fatalf("expected 1 delivery record, got %d", len(deliveries))
+	}
+	if deliveries[0].Status != "success" || deliveries[0].StatusCode != http.StatusOK {
+		t.Fatalf("expected final status success with HTTP 200, got status=%s code=%d", deliveries[0].Status, deliveries[0].StatusCode)
+	}
+}
+
+func TestWebhook_DeadLetterQueueAndRedelivery(t *testing.T) {
+	t.Setenv("AEITRON_DEV_MODE", "true")
+	listenerHealthy := atomic.Bool{}
+	attempts := atomic.Int32{}
+	recoveredCh := make(chan struct{}, 1)
+
+	mockEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		if !listenerHealthy.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"outage"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		select {
+		case recoveredCh <- struct{}{}:
+		default:
+		}
+	}))
+	defer mockEndpoint.Close()
+
+	gw := NewAPIGateway("test-secret-32-bytes")
+	defer gw.Close()
+
+	cfg := WebhookConfig{
+		MaxRetries:        3,
+		InitialBackoff:    10 * time.Millisecond,
+		BackoffMultiplier: 2.0,
+		HTTPTimeout:       1 * time.Second,
+		Workers:           2,
+		QueueSize:         100,
+	}
+	engine := NewWebhookEngine(cfg, gw.Metrics())
+	gw.SetWebhookEngine(engine)
+
+	_, err := engine.CreateSubscription("tenant_dlq", CreateSubscriptionRequest{
+		URL:    mockEndpoint.URL,
+		Events: []string{"ddos.detected"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create subscription: %v", err)
+	}
+
+	// Dispatch event while listener is unhealthy
+	_, err = engine.Dispatch(WebhookEvent{
+		Type:     "ddos.detected",
+		TenantID: "tenant_dlq",
+		Data:     []byte(`{"target_zone":"sg-sin-1","peak_gbps":450}`),
+	})
+	if err != nil {
+		t.Fatalf("failed to dispatch: %v", err)
+	}
+
+	// Wait for all 3 attempts to fail and land in DLQ
+	engine.WaitIdle(2 * time.Second)
+
+	// Verify DLQ via API
+	req := httptest.NewRequest(http.MethodGet, "/v1/webhooks/dead-letter", nil)
+	req.Header.Set("X-Tenant-ID", "tenant_dlq")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK listing dead letters, got %d", rec.Code)
+	}
+	var dlqResp struct {
+		DeadLetters []DeadLetterItem `json:"dead_letters"`
+		Count       int              `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &dlqResp); err != nil {
+		t.Fatalf("failed to parse DLQ response: %v", err)
+	}
+	if dlqResp.Count != 1 || len(dlqResp.DeadLetters) != 1 {
+		t.Fatalf("expected 1 dead-letter item, got count=%d len=%d", dlqResp.Count, len(dlqResp.DeadLetters))
+	}
+	deadDeliveryID := dlqResp.DeadLetters[0].Delivery.ID
+
+	// Now listener recovers
+	listenerHealthy.Store(true)
+
+	// Trigger redelivery via POST /v1/webhooks/dead-letter/retry
+	retryBody := fmt.Sprintf(`{"delivery_id":"%s"}`, deadDeliveryID)
+	req = httptest.NewRequest(http.MethodPost, "/v1/webhooks/dead-letter/retry", strings.NewReader(retryBody))
+	req.Header.Set("X-Tenant-ID", "tenant_dlq")
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on redelivery request, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	// Wait for redelivered item to reach mock server
+	select {
+	case <-recoveredCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for redelivered webhook to be received")
+	}
+
+	engine.WaitIdle(1 * time.Second)
+
+	// Verify DLQ is now empty
+	deadLetters := engine.ListDeadLetters("tenant_dlq")
+	if len(deadLetters) != 0 {
+		t.Fatalf("expected DLQ to be empty after successful redelivery, got %d items", len(deadLetters))
+	}
+}
+
+func TestWebhook_PrometheusMetrics(t *testing.T) {
+	gw := NewAPIGateway("test-secret-32-bytes")
+	defer gw.Close()
+
+	// Record sample webhook metrics
+	gw.Metrics().RecordWebhookDispatched("deployment.succeeded")
+	gw.Metrics().RecordWebhookDispatched("invoice.paid")
+	gw.Metrics().RecordWebhookDelivery("success")
+	gw.Metrics().RecordWebhookDelivery("retrying")
+	gw.Metrics().RecordWebhookDelivery("dead_letter")
+	gw.Metrics().RecordWebhookDLQ()
+	gw.Metrics().SetWebhookActiveSubscriptions(4)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	out := rec.Body.String()
+	if !strings.Contains(out, `aeitron_api_webhook_dispatched_total{event_type="deployment.succeeded"} 1`) {
+		t.Fatalf("expected webhook dispatched metric, got:\n%s", out)
+	}
+	if !strings.Contains(out, `aeitron_api_webhook_deliveries_total{status="success"} 1`) {
+		t.Fatalf("expected webhook deliveries success metric, got:\n%s", out)
+	}
+	if !strings.Contains(out, `aeitron_api_webhook_dlq_total 1`) {
+		t.Fatalf("expected webhook DLQ metric, got:\n%s", out)
+	}
+	if !strings.Contains(out, `aeitron_api_webhook_active_subscriptions 4`) {
+		t.Fatalf("expected webhook active subscriptions metric, got:\n%s", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Distributed State Adapter (Redis / KeyDB Cluster) Test Suite
+// ---------------------------------------------------------------------------
+
+type mockRedisServer struct {
+	listener net.Listener
+	addr     string
+	mu       sync.Mutex
+	data     map[string][]byte
+	closed   atomic.Bool
+}
+
+func startMockRedisServer(t *testing.T) *mockRedisServer {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen for mock redis: %v", err)
+	}
+	s := &mockRedisServer{
+		listener: ln,
+		addr:     ln.Addr().String(),
+		data:     make(map[string][]byte),
+	}
+	go s.serve()
+	return s
+}
+
+func (s *mockRedisServer) Close() {
+	s.closed.Store(true)
+	_ = s.listener.Close()
+}
+
+func (s *mockRedisServer) serve() {
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			return
+		}
+		go s.handleConn(conn)
+	}
+}
+
+func (s *mockRedisServer) handleConn(conn net.Conn) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	for {
+		if s.closed.Load() {
+			return
+		}
+		reply, err := readRESPReply(reader)
+		if err != nil {
+			return
+		}
+
+		args, ok := reply.([]any)
+		if !ok || len(args) == 0 {
+			continue
+		}
+
+		cmd := strings.ToUpper(fmt.Sprintf("%s", args[0]))
+		switch cmd {
+		case "PING":
+			_, _ = writer.WriteString("+PONG\r\n")
+		case "AUTH", "SELECT":
+			_, _ = writer.WriteString("+OK\r\n")
+		case "GET":
+			if len(args) > 1 {
+				k := fmt.Sprintf("%s", args[1])
+				s.mu.Lock()
+				val, exists := s.data[k]
+				s.mu.Unlock()
+				if !exists {
+					_, _ = writer.WriteString("$-1\r\n")
+				} else {
+					_, _ = writer.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(val), val))
+				}
+			}
+		case "SET":
+			if len(args) > 2 {
+				k := fmt.Sprintf("%s", args[1])
+				v := []byte(fmt.Sprintf("%s", args[2]))
+				s.mu.Lock()
+				s.data[k] = v
+				s.mu.Unlock()
+				_, _ = writer.WriteString("+OK\r\n")
+			}
+		case "DEL":
+			if len(args) > 1 {
+				k := fmt.Sprintf("%s", args[1])
+				s.mu.Lock()
+				delete(s.data, k)
+				s.mu.Unlock()
+				_, _ = writer.WriteString(":1\r\n")
+			}
+		case "KEYS":
+			pattern := "*"
+			if len(args) > 1 {
+				pattern = fmt.Sprintf("%s", args[1])
+			}
+			prefix := strings.TrimSuffix(pattern, "*")
+			s.mu.Lock()
+			var matched []string
+			for k := range s.data {
+				if strings.HasPrefix(k, prefix) {
+					matched = append(matched, k)
+				}
+			}
+			s.mu.Unlock()
+			_, _ = writer.WriteString(fmt.Sprintf("*%d\r\n", len(matched)))
+			for _, m := range matched {
+				_, _ = writer.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(m), m))
+			}
+		case "EVAL":
+			// Token-bucket EVAL script returns array: [allowed (1 or 0), remaining, retry_ms]
+			_, _ = writer.WriteString("*3\r\n:1\r\n:9\r\n:0\r\n")
+		default:
+			_, _ = writer.WriteString("+OK\r\n")
+		}
+		_ = writer.Flush()
+	}
+}
+
+func TestCluster_MemoryAdapter(t *testing.T) {
+	adapter := NewMemoryStateAdapter()
+	defer adapter.Close()
+
+	if adapter.Name() != "memory" {
+		t.Fatalf("expected adapter name memory, got %s", adapter.Name())
+	}
+	if err := adapter.Ping(context.Background()); err != nil {
+		t.Fatalf("unexpected ping error on memory adapter: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// KV Get/Set/Delete
+	if err := adapter.Set(ctx, "user:101", []byte("mahmud"), 10*time.Second); err != nil {
+		t.Fatalf("set failed: %v", err)
+	}
+	val, err := adapter.Get(ctx, "user:101")
+	if err != nil || string(val) != "mahmud" {
+		t.Fatalf("get failed: %v, val: %s", err, string(val))
+	}
+	if err := adapter.Delete(ctx, "user:101"); err != nil {
+		t.Fatalf("delete failed: %v", err)
+	}
+	_, err = adapter.Get(ctx, "user:101")
+	if err == nil {
+		t.Fatalf("expected error on missing key, got nil")
+	}
+
+	// DeletePrefix
+	_ = adapter.Set(ctx, "cache:products:1", []byte("p1"), 10*time.Second)
+	_ = adapter.Set(ctx, "cache:products:2", []byte("p2"), 10*time.Second)
+	_ = adapter.Set(ctx, "cache:orders:1", []byte("o1"), 10*time.Second)
+	deleted, err := adapter.DeletePrefix(ctx, "cache:products:")
+	if err != nil || deleted != 2 {
+		t.Fatalf("delete prefix failed: %v, count: %d", err, deleted)
+	}
+
+	// RateLimitAllow
+	allowed, rem, wait, err := adapter.RateLimitAllow(ctx, "ip:1.2.3.4", 10.0, 5)
+	if err != nil || !allowed || rem != 4 || wait != 0 {
+		t.Fatalf("ratelimit allow failed: allowed=%v, rem=%d, wait=%v, err=%v", allowed, rem, wait, err)
+	}
+
+	// Idempotency Acquire / Complete
+	acquired, existing, err := adapter.IdempotencyAcquire(ctx, "tenant:tx1", "hash1", 10*time.Second)
+	if err != nil || !acquired || existing == nil {
+		t.Fatalf("idempotency acquire failed: acquired=%v, err=%v", acquired, err)
+	}
+	// Second acquire should detect in-flight
+	acquired2, _, _ := adapter.IdempotencyAcquire(ctx, "tenant:tx1", "hash1", 10*time.Second)
+	if acquired2 {
+		t.Fatal("second acquire should not have succeeded")
+	}
+
+	// Complete
+	rec := existing
+	rec.StatusCode = 200
+	rec.ResponseBody = []byte("processed")
+	if err := adapter.IdempotencyComplete(ctx, "tenant:tx1", rec, 10*time.Second); err != nil {
+		t.Fatalf("idempotency complete failed: %v", err)
+	}
+
+	// Abort
+	_ = adapter.Set(ctx, "tenant:tx2", []byte("temp"), 10*time.Second)
+	if err := adapter.IdempotencyAbort(ctx, "tenant:tx2"); err != nil {
+		t.Fatalf("abort failed: %v", err)
+	}
+}
+
+func TestCluster_RESPWireProtocol(t *testing.T) {
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+
+	// Write command: SET key value EX 60
+	err := writeRESPCommand(writer, "SET", "cluster_key", "test_payload", "EX", "60")
+	if err != nil {
+		t.Fatalf("writeRESPCommand failed: %v", err)
+	}
+	_ = writer.Flush()
+
+	expectedHeader := "*5\r\n$3\r\nSET\r\n$11\r\ncluster_key\r\n$12\r\ntest_payload\r\n$2\r\nEX\r\n$2\r\n60\r\n"
+	if buf.String() != expectedHeader {
+		t.Fatalf("unexpected RESP wire format:\n%q\nexpected:\n%q", buf.String(), expectedHeader)
+	}
+
+	// Parse reply
+	reader := bufio.NewReader(strings.NewReader("+OK\r\n:42\r\n$5\r\nhello\r\n$-1\r\n*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"))
+	r1, _ := readRESPReply(reader)
+	if r1 != "OK" {
+		t.Fatalf("expected OK, got %v", r1)
+	}
+	r2, _ := readRESPReply(reader)
+	if r2 != int64(42) {
+		t.Fatalf("expected 42, got %v", r2)
+	}
+	r3, _ := readRESPReply(reader)
+	if r3 != "hello" {
+		t.Fatalf("expected hello, got %v", r3)
+	}
+	r4, _ := readRESPReply(reader)
+	if r4 != nil {
+		t.Fatalf("expected nil for $-1, got %v", r4)
+	}
+	r5, _ := readRESPReply(reader)
+	arr, ok := r5.([]any)
+	if !ok || len(arr) != 2 || arr[0] != "foo" || arr[1] != "bar" {
+		t.Fatalf("expected [foo bar], got %v", r5)
+	}
+}
+
+func TestCluster_RedisAdapter_LiveMock(t *testing.T) {
+	mockServer := startMockRedisServer(t)
+	defer mockServer.Close()
+
+	metrics := NewMetricsCollector(time.Now())
+	adapter, err := NewRedisStateAdapter("redis://"+mockServer.addr, DefaultRedisConfig(mockServer.addr), metrics)
+	if err != nil {
+		t.Fatalf("failed to create redis state adapter: %v", err)
+	}
+	defer adapter.Close()
+
+	if adapter.Name() != "redis" {
+		t.Fatalf("expected name redis, got %s", adapter.Name())
+	}
+
+	ctx := context.Background()
+
+	// Ping
+	if err := adapter.Ping(ctx); err != nil {
+		t.Fatalf("redis ping failed: %v", err)
+	}
+
+	// Set & Get
+	if err := adapter.Set(ctx, "cluster:token", []byte("bearer-xyz"), 30*time.Second); err != nil {
+		t.Fatalf("redis set failed: %v", err)
+	}
+	val, err := adapter.Get(ctx, "cluster:token")
+	if err != nil || string(val) != "bearer-xyz" {
+		t.Fatalf("redis get failed: %v, val: %s", err, string(val))
+	}
+
+	// Delete
+	if err := adapter.Delete(ctx, "cluster:token"); err != nil {
+		t.Fatalf("redis delete failed: %v", err)
+	}
+
+	// RateLimitAllow
+	allowed, rem, wait, err := adapter.RateLimitAllow(ctx, "user:42", 100.0, 10)
+	if err != nil || !allowed || rem != 9 || wait != 0 {
+		t.Fatalf("redis ratelimit allow failed: allowed=%v, rem=%d, wait=%v, err=%v", allowed, rem, wait, err)
+	}
+
+	// Idempotency Lifecycle
+	acquired, existing, err := adapter.IdempotencyAcquire(ctx, "idemp:req1", "hash123", 60*time.Second)
+	if err != nil || !acquired || existing == nil {
+		t.Fatalf("redis idempotency acquire failed: %v", err)
+	}
+	rec := existing
+	rec.StatusCode = 201
+	rec.ResponseBody = []byte(`{"created":true}`)
+	if err := adapter.IdempotencyComplete(ctx, "idemp:req1", rec, 60*time.Second); err != nil {
+		t.Fatalf("redis idempotency complete failed: %v", err)
+	}
+	if err := adapter.IdempotencyAbort(ctx, "idemp:req1"); err != nil {
+		t.Fatalf("redis idempotency abort failed: %v", err)
+	}
+}
+
+func TestCluster_RedisAdapter_FailOpen(t *testing.T) {
+	mockServer := startMockRedisServer(t)
+	metrics := NewMetricsCollector(time.Now())
+	adapter, err := NewRedisStateAdapter("redis://"+mockServer.addr, DefaultRedisConfig(mockServer.addr), metrics)
+	if err != nil {
+		t.Fatalf("failed to create redis state adapter: %v", err)
+	}
+	defer adapter.Close()
+
+	ctx := context.Background()
+	_ = adapter.Set(ctx, "k1", []byte("v1"), 10*time.Second)
+
+	// Terminate Redis mock server abruptly
+	mockServer.Close()
+
+	// Operations must fail-open to internal memory fallback without crashing or returning errors
+	err = adapter.Set(ctx, "k2", []byte("v2"), 10*time.Second)
+	if err != nil {
+		t.Fatalf("expected fail-open set to succeed, got %v", err)
+	}
+	val, err := adapter.Get(ctx, "k2")
+	if err != nil || string(val) != "v2" {
+		t.Fatalf("expected fail-open get to retrieve from memory fallback, got val: %s, err: %v", string(val), err)
+	}
+
+	allowed, rem, _, err := adapter.RateLimitAllow(ctx, "ip:5.5.5.5", 10.0, 5)
+	if err != nil || !allowed || rem != 4 {
+		t.Fatalf("expected fail-open ratelimit to succeed via memory, allowed=%v, rem=%d, err=%v", allowed, rem, err)
+	}
+
+	acquired, _, err := adapter.IdempotencyAcquire(ctx, "idemp:failopen", "hashabc", 10*time.Second)
+	if err != nil || !acquired {
+		t.Fatalf("expected fail-open idempotency acquire to succeed via memory, acquired=%v, err=%v", acquired, err)
+	}
+}
+
+func TestCluster_GatewayAutoDetection(t *testing.T) {
+	// 1. Without REDIS_URL -> defaults to MemoryStateAdapter
+	t.Setenv("REDIS_URL", "")
+	gwMem := NewAPIGateway("jwt-secret")
+	defer gwMem.Close()
+
+	if gwMem.StateAdapter().Name() != "memory" {
+		t.Fatalf("expected standalone memory adapter, got %s", gwMem.StateAdapter().Name())
+	}
+
+	// 2. With REDIS_URL -> auto-connects to RedisStateAdapter
+	mockServer := startMockRedisServer(t)
+	defer mockServer.Close()
+
+	t.Setenv("REDIS_URL", "redis://"+mockServer.addr)
+	gwRedis := NewAPIGateway("jwt-secret")
+	defer gwRedis.Close()
+
+	if gwRedis.StateAdapter().Name() != "redis" {
+		t.Fatalf("expected distributed redis adapter, got %s", gwRedis.StateAdapter().Name())
+	}
+}
+
+func TestCluster_EndpointAndTelemetry(t *testing.T) {
+	// Standalone Gateway
+	t.Setenv("REDIS_URL", "")
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/gateway/cluster", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/gateway/cluster, got %d", rec.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse cluster JSON: %v", err)
+	}
+	if resp["mode"] != "memory" || resp["status"] != "standalone" {
+		t.Fatalf("unexpected cluster telemetry: %v", resp)
+	}
+
+	// Connected Gateway
+	mockServer := startMockRedisServer(t)
+	defer mockServer.Close()
+
+	t.Setenv("REDIS_URL", "redis://"+mockServer.addr)
+	gwCluster := NewAPIGateway("jwt-secret")
+	defer gwCluster.Close()
+
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/gateway/cluster", nil)
+	rec2 := httptest.NewRecorder()
+	gwCluster.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/gateway/cluster, got %d", rec2.Code)
+	}
+	var resp2 map[string]any
+	if err := json.Unmarshal(rec2.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("failed to parse cluster JSON: %v", err)
+	}
+	if resp2["mode"] != "redis" || resp2["status"] != "connected" {
+		t.Fatalf("unexpected connected cluster telemetry: %v", resp2)
+	}
+}
+
+func TestCluster_PrometheusMetrics(t *testing.T) {
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	gw.Metrics().SetClusterMode("redis")
+	gw.Metrics().RecordClusterOp("get_hit")
+	gw.Metrics().RecordClusterOp("set")
+	gw.Metrics().RecordClusterError()
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	out := rec.Body.String()
+	if !strings.Contains(out, `aeitron_api_cluster_state_mode{mode="redis"} 1`) {
+		t.Fatalf("missing cluster mode in metrics:\n%s", out)
+	}
+	if !strings.Contains(out, `aeitron_api_cluster_state_ops_total{op="get_hit"} 1`) {
+		t.Fatalf("missing cluster op in metrics:\n%s", out)
+	}
+	if !strings.Contains(out, `aeitron_api_cluster_state_errors_total 1`) {
+		t.Fatalf("missing cluster error in metrics:\n%s", out)
+	}
+}
+
+func TestCluster_MultiTierCache(t *testing.T) {
+	mockServer := startMockRedisServer(t)
+	defer mockServer.Close()
+
+	t.Setenv("REDIS_URL", "redis://"+mockServer.addr)
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	cacheEngine := gw.Cache()
+
+	// Seed L2 directly via cluster adapter
+	key := "public:GET:/v1/catalog"
+	now := time.Now().UTC()
+	l2Entry := CacheEntry{
+		Key:        key,
+		Path:       "/v1/catalog",
+		StatusCode: 200,
+		Headers:    map[string]string{"Content-Type": "application/json"},
+		Body:       []byte(`{"products":["compute","vps"]}`),
+		CachedAt:   now,
+		ExpiresAt:  now.Add(60 * time.Second),
+		TTL:        60 * time.Second,
+		ETag:       `"l2-etag-123"`,
+	}
+	l2Data, _ := json.Marshal(l2Entry)
+	_ = gw.StateAdapter().Set(context.Background(), "cache:"+key, l2Data, 60*time.Second)
+
+	// L1 Cache is currently cold
+	entry, hit := cacheEngine.Lookup(key)
+	if !hit || entry == nil {
+		t.Fatalf("expected cache lookup to hit L2 distributed cache and return entry")
+	}
+	if string(entry.Body) != `{"products":["compute","vps"]}` {
+		t.Fatalf("unexpected entry body from L2: %s", string(entry.Body))
+	}
+
+	// Subsequent lookup hits L1 in-memory immediately
+	entry2, hit2 := cacheEngine.Lookup(key)
+	if !hit2 || entry2 == nil {
+		t.Fatalf("expected L1 cache hit on second lookup")
+	}
+
+	// Purge via gateway invalidates both L1 and L2
+	req := httptest.NewRequest(http.MethodDelete, "/v1/gateway/cache", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from cache purge, got %d", rec.Code)
+	}
+
+	_, hitAfterPurge := cacheEngine.Lookup(key)
+	if hitAfterPurge {
+		t.Fatal("expected cache miss after cluster purge")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Distributed Tracing Tests (W3C traceparent, OpenTelemetry & Jaeger)
+// ---------------------------------------------------------------------------
+
+func TestTracing_W3CGenerationAndPropagation(t *testing.T) {
+	var upstreamReceivedTP, upstreamReceivedState string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamReceivedTP = r.Header.Get("traceparent")
+		upstreamReceivedState = r.Header.Get("tracestate")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("jwt-secret-xyz-32-bytes-long")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/trace-test",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/trace-test/data", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	// 1. Verify W3C traceparent format in client response
+	respTP := rec.Header().Get("traceparent")
+	if respTP == "" {
+		t.Fatalf("expected traceparent header in gateway response")
+	}
+	tpRegex := regexp.MustCompile(`^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$`)
+	matches := tpRegex.FindStringSubmatch(respTP)
+	if len(matches) != 4 {
+		t.Fatalf("traceparent header '%s' does not match W3C specification", respTP)
+	}
+	traceID := matches[1]
+	flags := matches[3]
+	if flags != "01" {
+		t.Fatalf("expected sampled flag '01', got '%s'", flags)
+	}
+
+	respState := rec.Header().Get("tracestate")
+	if !strings.Contains(respState, "aeitron=gateway") {
+		t.Fatalf("expected tracestate to include 'aeitron=gateway', got '%s'", respState)
+	}
+
+	// 2. Verify W3C traceparent propagated to upstream with same trace-id and child span-id
+	if upstreamReceivedTP == "" {
+		t.Fatalf("expected upstream to receive propagated traceparent")
+	}
+	upMatches := tpRegex.FindStringSubmatch(upstreamReceivedTP)
+	if len(upMatches) != 4 {
+		t.Fatalf("upstream traceparent '%s' does not match W3C specification", upstreamReceivedTP)
+	}
+	if upMatches[1] != traceID {
+		t.Fatalf("expected upstream traceID '%s' to match root traceID '%s'", upMatches[1], traceID)
+	}
+	if !strings.Contains(upstreamReceivedState, "aeitron=gateway") {
+		t.Fatalf("expected upstream tracestate to include 'aeitron=gateway', got '%s'", upstreamReceivedState)
+	}
+}
+
+func TestTracing_IncomingTraceparentPreserved(t *testing.T) {
+	incomingTraceID := "4bf92f3577b34da6a3ce929d0e0e4736"
+	incomingParentSpan := "00f067aa0ba902b7"
+	incomingTP := fmt.Sprintf("00-%s-%s-01", incomingTraceID, incomingParentSpan)
+
+	var upstreamReceivedTP string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamReceivedTP = r.Header.Get("traceparent")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"acknowledged":true}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/trace-preserve",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/trace-preserve/item", nil)
+	req.Header.Set("traceparent", incomingTP)
+	req.Header.Set("tracestate", "congo=t61rcWkgMzE")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	respTP := rec.Header().Get("traceparent")
+	if !strings.Contains(respTP, incomingTraceID) {
+		t.Fatalf("expected gateway to preserve incoming trace ID '%s', got '%s'", incomingTraceID, respTP)
+	}
+
+	// Upstream should also receive the incoming trace ID
+	if !strings.Contains(upstreamReceivedTP, incomingTraceID) {
+		t.Fatalf("expected upstream to receive incoming trace ID '%s', got '%s'", incomingTraceID, upstreamReceivedTP)
+	}
+}
+
+func TestTracing_MicrosecondSpansRecorded(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"success"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("jwt-secret-testing-32-bytes-long")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/orders",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: false,
+		CacheTTL:       30 * time.Second,
+	})
+
+	// Generate authenticated token
+	token, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "user-42",
+		TenantID: "tenant-enterprise-99",
+		Role:     "admin",
+		Tier:     "enterprise",
+		Exp:      time.Now().Add(time.Hour).Unix(),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/orders/123", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	respTP := rec.Header().Get("traceparent")
+	parts := strings.Split(respTP, "-")
+	traceID := parts[1]
+
+	// Query trace details via /v1/gateway/traces/{trace_id}
+	traceReq := httptest.NewRequest(http.MethodGet, "/v1/gateway/traces/"+traceID, nil)
+	traceRec := httptest.NewRecorder()
+	gw.ServeHTTP(traceRec, traceReq)
+
+	if traceRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for trace detail query, got %d", traceRec.Code)
+	}
+
+	var tc TraceContext
+	if err := json.Unmarshal(traceRec.Body.Bytes(), &tc); err != nil {
+		t.Fatalf("failed to decode trace response: %v", err)
+	}
+
+	if tc.TraceID != traceID {
+		t.Fatalf("expected traceID %s, got %s", traceID, tc.TraceID)
+	}
+	if tc.DurationMicros <= 0 {
+		t.Fatalf("expected positive duration in microseconds, got %d", tc.DurationMicros)
+	}
+
+	// Verify tracked lifecycle spans: ingress, ratelimit, auth, cache, upstream
+	spanNames := make(map[string]*Span)
+	for _, s := range tc.Spans {
+		spanNames[s.Name] = s
+	}
+
+	expectedSpans := []string{
+		"gateway.ingress",
+		"gateway.ratelimit",
+		"gateway.auth",
+		"gateway.cache",
+		"gateway.upstream",
+	}
+
+	for _, name := range expectedSpans {
+		s, ok := spanNames[name]
+		if !ok {
+			t.Errorf("expected span '%s' to be recorded in trace", name)
+			continue
+		}
+		if s.DurationMicros < 0 {
+			t.Errorf("span '%s' has invalid duration %d", name, s.DurationMicros)
+		}
+	}
+
+	// Check auth span attributes
+	authSpan := spanNames["gateway.auth"]
+	if authSpan != nil {
+		if authSpan.Attributes["tenant_id"] != "tenant-enterprise-99" {
+			t.Fatalf("expected auth span tenant_id 'tenant-enterprise-99', got '%s'", authSpan.Attributes["tenant_id"])
+		}
+	}
+
+	// Check upstream span attributes
+	upSpan := spanNames["gateway.upstream"]
+	if upSpan != nil {
+		if upSpan.Attributes["upstream.route"] != "/v1/orders" {
+			t.Fatalf("expected upstream span route '/v1/orders', got '%s'", upSpan.Attributes["upstream.route"])
+		}
+	}
+}
+
+func TestTracing_SlowTraceDetection(t *testing.T) {
+	// Mock upstream with simulated 60ms delay (> 50ms default threshold)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(55 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"delay":"completed"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/slow-svc",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+	})
+
+	initialSlow := gw.Metrics().SlowTracesTotal()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/slow-svc/compute", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	// Verify slow trace metric incremented
+	currentSlow := gw.Metrics().SlowTracesTotal()
+	if currentSlow <= initialSlow {
+		t.Fatalf("expected slow traces count to increment, initially %d, now %d", initialSlow, currentSlow)
+	}
+
+	// Verify query to /v1/gateway/traces/slow
+	slowReq := httptest.NewRequest(http.MethodGet, "/v1/gateway/traces/slow", nil)
+	slowRec := httptest.NewRecorder()
+	gw.ServeHTTP(slowRec, slowReq)
+
+	if slowRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for slow traces endpoint, got %d", slowRec.Code)
+	}
+
+	var slowResp struct {
+		SlowTraces []*TraceContext `json:"slow_traces"`
+		Count      int             `json:"count"`
+	}
+	if err := json.Unmarshal(slowRec.Body.Bytes(), &slowResp); err != nil {
+		t.Fatalf("failed to decode slow traces response: %v", err)
+	}
+
+	if slowResp.Count == 0 {
+		t.Fatalf("expected at least 1 slow trace in /v1/gateway/traces/slow response")
+	}
+	if slowResp.SlowTraces[0].DurationMicros < 50000 {
+		t.Fatalf("expected slow trace duration >= 50,000 micros (50ms), got %d", slowResp.SlowTraces[0].DurationMicros)
+	}
+}
+
+func TestTracing_OpenTelemetryAndJaegerExport(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"export":"test"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/export-test",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/export-test/run", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	respTP := rec.Header().Get("traceparent")
+	traceID := strings.Split(respTP, "-")[1]
+
+	// 1. Export in OpenTelemetry (OTLP) Format
+	otlpReq := httptest.NewRequest(http.MethodGet, "/v1/gateway/traces/"+traceID+"/export?format=otlp", nil)
+	otlpRec := httptest.NewRecorder()
+	gw.ServeHTTP(otlpRec, otlpReq)
+
+	if otlpRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for OTLP export, got %d", otlpRec.Code)
+	}
+	var otlpMap map[string]any
+	if err := json.Unmarshal(otlpRec.Body.Bytes(), &otlpMap); err != nil {
+		t.Fatalf("failed to unmarshal OTLP export: %v", err)
+	}
+	if _, ok := otlpMap["resourceSpans"]; !ok {
+		t.Fatalf("expected 'resourceSpans' in OTLP export schema")
+	}
+
+	// 2. Export in Jaeger Format
+	jaegerReq := httptest.NewRequest(http.MethodGet, "/v1/gateway/traces/"+traceID+"/export?format=jaeger", nil)
+	jaegerRec := httptest.NewRecorder()
+	gw.ServeHTTP(jaegerRec, jaegerReq)
+
+	if jaegerRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for Jaeger export, got %d", jaegerRec.Code)
+	}
+	var jaegerMap map[string]any
+	if err := json.Unmarshal(jaegerRec.Body.Bytes(), &jaegerMap); err != nil {
+		t.Fatalf("failed to unmarshal Jaeger export: %v", err)
+	}
+	dataList, ok := jaegerMap["data"].([]any)
+	if !ok || len(dataList) == 0 {
+		t.Fatalf("expected 'data' array in Jaeger export")
+	}
+	firstTrace := dataList[0].(map[string]any)
+	if firstTrace["traceID"] != traceID {
+		t.Fatalf("expected Jaeger traceID %s, got %v", traceID, firstTrace["traceID"])
+	}
+}
+
+func TestTracing_ZipkinExport(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"zipkin":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/zipkin-test",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/zipkin-test/check", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	respTP := rec.Header().Get("traceparent")
+	traceID := strings.Split(respTP, "-")[1]
+
+	zipkinReq := httptest.NewRequest(http.MethodGet, "/v1/gateway/traces/"+traceID+"/export?format=zipkin", nil)
+	zipkinRec := httptest.NewRecorder()
+	gw.ServeHTTP(zipkinRec, zipkinReq)
+
+	if zipkinRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for Zipkin export, got %d", zipkinRec.Code)
+	}
+	var zipkinSpans []map[string]any
+	if err := json.Unmarshal(zipkinRec.Body.Bytes(), &zipkinSpans); err != nil {
+		t.Fatalf("failed to decode Zipkin JSON spans: %v", err)
+	}
+	if len(zipkinSpans) == 0 {
+		t.Fatalf("expected non-empty array of Zipkin spans")
+	}
+	if zipkinSpans[0]["traceId"] != traceID {
+		t.Fatalf("expected Zipkin span traceId %s, got %v", traceID, zipkinSpans[0]["traceId"])
+	}
+}
+
+func TestTracing_DynamicConfigurationAndStats(t *testing.T) {
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	// 1. Initial Stats
+	statsReq := httptest.NewRequest(http.MethodGet, "/v1/gateway/traces/stats", nil)
+	statsRec := httptest.NewRecorder()
+	gw.ServeHTTP(statsRec, statsReq)
+
+	if statsRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for stats, got %d", statsRec.Code)
+	}
+	var stats TracingStats
+	_ = json.Unmarshal(statsRec.Body.Bytes(), &stats)
+	if stats.MaxCapacity != 10000 {
+		t.Fatalf("expected max capacity 10,000, got %d", stats.MaxCapacity)
+	}
+
+	// 2. Dynamic Config Update: set sampling to 0.75 and slow threshold to 80ms
+	cfgBody := `{"sampling_rate": 0.75, "slow_threshold_ms": 80}`
+	cfgReq := httptest.NewRequest(http.MethodPost, "/v1/gateway/traces/config", strings.NewReader(cfgBody))
+	cfgRec := httptest.NewRecorder()
+	gw.ServeHTTP(cfgRec, cfgReq)
+
+	if cfgRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for config update, got %d", cfgRec.Code)
+	}
+
+	var updateResp struct {
+		Status string       `json:"status"`
+		Stats  TracingStats `json:"stats"`
+	}
+	_ = json.Unmarshal(cfgRec.Body.Bytes(), &updateResp)
+	if updateResp.Stats.SamplingRate != 0.75 {
+		t.Fatalf("expected sampling rate 0.75, got %f", updateResp.Stats.SamplingRate)
+	}
+	if updateResp.Stats.SlowThresholdMs != 80 {
+		t.Fatalf("expected slow threshold 80ms, got %d", updateResp.Stats.SlowThresholdMs)
+	}
+}
+
+func TestTracing_PrometheusMetrics(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"metrics":"tracing"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/metric-test",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/metric-test/sample", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	// Fetch /metrics
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRec := httptest.NewRecorder()
+	gw.ServeHTTP(metricsRec, metricsReq)
+
+	if metricsRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /metrics, got %d", metricsRec.Code)
+	}
+
+	output := metricsRec.Body.String()
+	if !strings.Contains(output, "aeitron_api_traces_total") {
+		t.Fatalf("expected 'aeitron_api_traces_total' in metrics output")
+	}
+	if !strings.Contains(output, "aeitron_api_spans_total{name=\"gateway.ingress\"}") {
+		t.Fatalf("expected 'aeitron_api_spans_total{name=\"gateway.ingress\"}' in metrics output")
+	}
+	if !strings.Contains(output, "aeitron_api_slow_traces_total") {
+		t.Fatalf("expected 'aeitron_api_slow_traces_total' in metrics output")
+	}
+}
+
+func TestAPIGateway_Versioning_DefaultBaseline(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/version-test",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/version-test/resource", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	version := rec.Header().Get("Aeitron-Version")
+	if version != "2026-11-01" {
+		t.Fatalf("expected default baseline version '2026-11-01', got %q", version)
+	}
+	vary := rec.Header().Get("Vary")
+	if !strings.Contains(vary, "Aeitron-Version") {
+		t.Fatalf("expected Vary header to contain Aeitron-Version, got %q", vary)
+	}
+	if rec.Header().Get("X-Aeitron-Deprecation-Date") != "" {
+		t.Fatalf("did not expect deprecation header on baseline version")
+	}
+}
+
+func TestAPIGateway_Versioning_ExplicitVersion(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/version-test",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/version-test/resource", nil)
+	req.Header.Set("Aeitron-Version", "2026-06-01")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	version := rec.Header().Get("Aeitron-Version")
+	if version != "2026-06-01" {
+		t.Fatalf("expected version '2026-06-01', got %q", version)
+	}
+	if rec.Header().Get("X-Aeitron-Deprecation-Date") != "" {
+		t.Fatalf("did not expect deprecation header on active 2026-06-01 version")
+	}
+}
+
+func TestAPIGateway_Versioning_MalformedRejected(t *testing.T) {
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/version-test/resource", nil)
+	req.Header.Set("Aeitron-Version", "2026/11/01")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400 for malformed version date, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "YYYY-MM-DD") {
+		t.Fatalf("expected error message to explain YYYY-MM-DD format, got %s", rec.Body.String())
+	}
+}
+
+func TestAPIGateway_Versioning_UnsupportedRejected(t *testing.T) {
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/version-test/resource", nil)
+	req.Header.Set("Aeitron-Version", "2020-01-01")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400 for unsupported version, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "supported versions") {
+		t.Fatalf("expected error message to list supported versions, got %s", rec.Body.String())
+	}
+}
+
+func TestAPIGateway_Versioning_DeprecationHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"deprecated_compat_ok"}`))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/version-test",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/version-test/resource", nil)
+	req.Header.Set("Aeitron-Version", "2026-01-01")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	// Verify RFC 8594 / Stripe deprecation headers
+	version := rec.Header().Get("Aeitron-Version")
+	if version != "2026-01-01" {
+		t.Fatalf("expected version '2026-01-01', got %q", version)
+	}
+
+	depDate := rec.Header().Get("X-Aeitron-Deprecation-Date")
+	if depDate != "2027-01-01" {
+		t.Fatalf("expected X-Aeitron-Deprecation-Date '2027-01-01', got %q", depDate)
+	}
+
+	sunset := rec.Header().Get("Sunset")
+	if sunset == "" || !strings.Contains(sunset, "2027") {
+		t.Fatalf("expected valid RFC 8594 Sunset header, got %q", sunset)
+	}
+
+	link := rec.Header().Get("Link")
+	if !strings.Contains(link, "rel=\"deprecation\"") {
+		t.Fatalf("expected Link header with rel=deprecation, got %q", link)
+	}
+
+	warning := rec.Header().Get("X-Aeitron-Warning")
+	if !strings.Contains(warning, "2027-01-01") || !strings.Contains(warning, "deprecated") {
+		t.Fatalf("expected deprecation warning header, got %q", warning)
+	}
+}
+
+func TestAPIGateway_Versioning_CachePartitioning(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		ver := r.Header.Get("Aeitron-Version")
+		if ver == "" {
+			ver = "none"
+		}
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"version":"%s","call":%d}`, ver, callCount)))
+	}))
+	defer upstream.Close()
+
+	gw := NewAPIGateway("jwt-secret")
+	defer gw.Close()
+
+	_ = gw.RegisterRoute(RouteRule{
+		PathPrefix:     "/v1/cache-version",
+		UpstreamURL:    upstream.URL,
+		AllowAnonymous: true,
+		CacheTTL:       60 * time.Second,
+	})
+
+	// 1. First request with baseline version (2026-11-01) -> Cache MISS, upstream call 1
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/cache-version/data", nil)
+	req1.Header.Set("Aeitron-Version", "2026-11-01")
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, req1)
+	if rec1.Header().Get("X-Cache") != "MISS" {
+		t.Fatalf("expected MISS on first request, got %q", rec1.Header().Get("X-Cache"))
+	}
+
+	// 2. Second request with same baseline version -> Cache HIT
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/cache-version/data", nil)
+	req2.Header.Set("Aeitron-Version", "2026-11-01")
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, req2)
+	if rec2.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("expected HIT on second request with identical version, got %q", rec2.Header().Get("X-Cache"))
+	}
+
+	// 3. Third request with different version (2026-06-01) -> Cache MISS, upstream call 2 (partition isolated)
+	req3 := httptest.NewRequest(http.MethodGet, "/v1/cache-version/data", nil)
+	req3.Header.Set("Aeitron-Version", "2026-06-01")
+	rec3 := httptest.NewRecorder()
+	gw.ServeHTTP(rec3, req3)
+	if rec3.Header().Get("X-Cache") != "MISS" {
+		t.Fatalf("expected MISS on third request with different version, got %q", rec3.Header().Get("X-Cache"))
+	}
+	if rec3.Header().Get("Aeitron-Version") != "2026-06-01" {
+		t.Fatalf("expected version 2026-06-01, got %q", rec3.Header().Get("Aeitron-Version"))
+	}
+}
+
+func TestSecurity_JWTHeaderValidationAndAlgNone(t *testing.T) {
+	secret := "test-secret-32-bytes-auth-scopes-gate"
+	gw := NewAPIGateway(secret)
+
+	// 1. Attack: alg=none token
+	noneHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"attacker","tenant_id":"t1","exp":9999999999}`))
+	noneToken := noneHeader + "." + payload + "."
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/databases/instances", nil)
+	req.Header.Set("Authorization", "Bearer "+noneToken)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for alg=none, got %d", rec.Code)
+	}
+
+	// 2. Attack: unsupported alg=RS256
+	rsHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	rsToken := rsHeader + "." + payload + ".somesig"
+	req = httptest.NewRequest(http.MethodGet, "/v1/databases/instances", nil)
+	req.Header.Set("Authorization", "Bearer "+rsToken)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for alg=RS256, got %d", rec.Code)
+	}
+
+	// 3. Attack: missing exp timestamp (exp=0)
+	noExpToken, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "usr_no_exp",
+		TenantID: "tenant_corp",
+		Exp:      0,
+	})
+	req = httptest.NewRequest(http.MethodGet, "/v1/databases/instances", nil)
+	req.Header.Set("Authorization", "Bearer "+noExpToken)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for missing exp, got %d", rec.Code)
+	}
+
+	// 4. Attack: missing tenant_id claim
+	noTenantToken, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "usr_no_tenant",
+		TenantID: "",
+		Exp:      time.Now().Add(time.Hour).Unix(),
+	})
+	req = httptest.NewRequest(http.MethodGet, "/v1/databases/instances", nil)
+	req.Header.Set("Authorization", "Bearer "+noTenantToken)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for missing tenant_id, got %d", rec.Code)
+	}
+}
+
+func TestSecurity_RouteMatchingSegmentBoundary(t *testing.T) {
+	gw := NewAPIGateway("test-secret-32-bytes-auth-scopes-gate")
+
+	// Verify route prefix isolation: /v1/auth is anonymous, but /v1/auth-malicious or /v1/auth_attack must NOT match /v1/auth
+	rule, _ := gw.matchRoute("/v1/auth-malicious")
+	if rule != nil && rule.PathPrefix == "/v1/auth" {
+		t.Fatalf("security violation: /v1/auth-malicious must not match /v1/auth prefix")
+	}
+
+	// Verify path traversal cleaning: /v1/auth/../billing should resolve to /v1/billing, NOT /v1/auth
+	rule, _ = gw.matchRoute("/v1/auth/../billing")
+	if rule == nil || rule.PathPrefix != "/v1/billing" {
+		t.Fatalf("expected /v1/auth/../billing to clean and match /v1/billing, got rule: %v", rule)
+	}
+}
+
+func TestSecurity_SSRFUpstreamRegistration(t *testing.T) {
+	gw := NewAPIGateway("test-secret-32-bytes-auth-scopes-gate")
+
+	// 1. Attempt to register cloud metadata IP
+	err := gw.RegisterRoute(RouteRule{
+		PathPrefix:  "/v1/exploit-metadata",
+		UpstreamURL: "http://169.254.169.254/latest/meta-data",
+	})
+	if err == nil {
+		t.Fatalf("expected RegisterRoute to reject 169.254.169.254, but succeeded")
+	}
+
+	// 2. Attempt to register metadata.google.internal
+	err = gw.RegisterRoute(RouteRule{
+		PathPrefix:  "/v1/exploit-gcp",
+		UpstreamURL: "http://metadata.google.internal/computeMetadata/v1/",
+	})
+	if err == nil {
+		t.Fatalf("expected RegisterRoute to reject metadata.google.internal, but succeeded")
+	}
+}
+
+func TestSecurity_AdministrativeCachePurge(t *testing.T) {
+	gw := NewAPIGateway("test-secret-32-bytes-auth-scopes-gate")
+
+	// 1. Operator with admin role can purge cache and spools audit record
+	adminToken, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "usr_admin",
+		TenantID: "tenant_master",
+		Role:     "admin",
+		Exp:      time.Now().Add(time.Hour).Unix(),
+	})
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/gateway/cache", nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for admin cache purge, got %d", rec.Code)
+	}
+
+	// Verify audit record was spooled
+	time.Sleep(50 * time.Millisecond)
+	records := gw.AuditSpooler().GetRecords()
+	found := false
+	for _, r := range records {
+		if r.Path == "/v1/gateway/cache" && r.ActorID == "usr_admin" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected audit record for admin cache purge to be spooled")
+	}
+
+	// 2. Member with insufficient scope receives 403 Forbidden
+	memberToken, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "usr_member",
+		TenantID: "tenant_regular",
+		Role:     "member",
+		Scopes:   []string{"billing:read"}, // missing cache:purge or admin
+		Exp:      time.Now().Add(time.Hour).Unix(),
+	})
+
+	req = httptest.NewRequest(http.MethodDelete, "/v1/gateway/cache", nil)
+	req.Header.Set("Authorization", "Bearer "+memberToken)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for member cache purge, got %d", rec.Code)
+	}
+}
+
+func TestSecurity_CORSOriginAllowlist(t *testing.T) {
+	gw := NewAPIGateway("test-secret-32-bytes-auth-scopes-gate")
+
+	// 1. Allowed Origin -> returns Allow-Origin and Vary: Origin
+	req := httptest.NewRequest(http.MethodOptions, "/v1/databases/instances", nil)
+	req.Header.Set("Origin", "https://dashboard.aeitron.com")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content for allowed origin, got %d", rec.Code)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "https://dashboard.aeitron.com" {
+		t.Fatalf("expected Access-Control-Allow-Origin to match, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+	if !strings.Contains(rec.Header().Get("Vary"), "Origin") {
+		t.Fatalf("expected Vary: Origin header to be set")
+	}
+
+	// 2. Disallowed Origin on OPTIONS preflight -> 403 Forbidden
+	reqBad := httptest.NewRequest(http.MethodOptions, "/v1/databases/instances", nil)
+	reqBad.Header.Set("Origin", "https://evil-phishing-attacker.com")
+	recBad := httptest.NewRecorder()
+	gw.ServeHTTP(recBad, reqBad)
+
+	if recBad.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for disallowed origin preflight, got %d", recBad.Code)
+	}
+
+	// 3. Disallowed Origin on GET request -> do NOT reflect origin header
+	reqBadGet := httptest.NewRequest(http.MethodGet, "/ready", nil)
+	reqBadGet.Header.Set("Origin", "https://evil-phishing-attacker.com")
+	recBadGet := httptest.NewRecorder()
+	gw.ServeHTTP(recBadGet, reqBadGet)
+
+	if recBadGet.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("security violation: untrusted origin was reflected in Access-Control-Allow-Origin")
+	}
+}
+
+func TestSecurity_AdminEndpointsProtectionInProduction(t *testing.T) {
+	// Enable production mode for test
+	t.Setenv("AEITRON_ENV", "production")
+
+	gw := NewAPIGateway("test-secret-32-bytes-auth-scopes-gate")
+
+	adminEndpoints := []string{
+		"/v1/gateway/routes",
+		"/v1/gateway/stats",
+		"/v1/gateway/upstreams",
+		"/v1/gateway/cluster",
+		"/v1/gateway/traces",
+	}
+
+	// 1. Unauthenticated requests in production must fail closed with 401 Unauthorized
+	for _, ep := range adminEndpoints {
+		req := httptest.NewRequest(http.MethodGet, ep, nil)
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401 Unauthorized for unauthenticated production access to %s, got %d", ep, rec.Code)
+		}
+	}
+
+	// 2. Regular member user must receive 403 Forbidden
+	memberToken, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "usr_regular",
+		TenantID: "tenant_abc",
+		Role:     "member",
+		Exp:      time.Now().Add(time.Hour).Unix(),
+	})
+	for _, ep := range adminEndpoints {
+		req := httptest.NewRequest(http.MethodGet, ep, nil)
+		req.Header.Set("Authorization", "Bearer "+memberToken)
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("expected 403 Forbidden for member access to %s, got %d", ep, rec.Code)
+		}
+	}
+
+	// 3. Admin / operator user receives 200 OK
+	adminToken, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "usr_operator",
+		TenantID: "tenant_system",
+		Role:     "admin",
+		Exp:      time.Now().Add(time.Hour).Unix(),
+	})
+	for _, ep := range adminEndpoints {
+		req := httptest.NewRequest(http.MethodGet, ep, nil)
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for admin access to %s, got %d (body: %s)", ep, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestSecurity_NewUpstreamProxy_SSRFValidation(t *testing.T) {
+	// Attempt to create proxy pointing to cloud metadata
+	_, err := NewUpstreamProxy(RouteRule{
+		PathPrefix:  "/v1/attack",
+		UpstreamURL: "http://169.254.169.254/latest/meta-data",
+	})
+	if err == nil {
+		t.Fatalf("expected NewUpstreamProxy to reject 169.254.169.254, but succeeded")
+	}
+
+	// Attempt to create proxy with unsupported protocol
+	_, err = NewUpstreamProxy(RouteRule{
+		PathPrefix:  "/v1/attack-ftp",
+		UpstreamURL: "ftp://127.0.0.1:21/payload",
+	})
+	if err == nil {
+		t.Fatalf("expected NewUpstreamProxy to reject ftp scheme, but succeeded")
+	}
+}
+
+func TestSecurity_EphemeralRandomSecretWhenEmpty(t *testing.T) {
+	// Calling NewAuthenticator with empty secret must generate random 32-byte secret, never a fixed string
+	auth1 := NewAuthenticator("")
+	auth2 := NewAuthenticator("")
+
+	if len(auth1.jwtSecret) < 32 {
+		t.Fatalf("expected generated secret to be >= 32 bytes, got %d", len(auth1.jwtSecret))
+	}
+	if string(auth1.jwtSecret) == string(auth2.jwtSecret) {
+		t.Fatalf("ephemeral secrets must be random per instance, got identical secrets")
+	}
+	if string(auth1.jwtSecret) == "aeitron-default-secret-key-change-in-production-32bytes" {
+		t.Fatalf("must not use predictable default fixed string")
+	}
 }

@@ -1,8 +1,10 @@
 package apigateway
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -20,6 +22,7 @@ type CacheEntry struct {
 	StatusCode   int               `json:"status_code"`
 	Headers      map[string]string `json:"headers"`
 	Body         []byte            `json:"body"`
+	GzipBody     []byte            `json:"gzip_body,omitempty"`
 	CachedAt     time.Time         `json:"cached_at"`
 	ExpiresAt    time.Time         `json:"expires_at"`
 	TTL          time.Duration     `json:"ttl"`
@@ -44,6 +47,7 @@ type RFC9111CacheEngine struct {
 	maxEntries   int
 	maxBytes     int64
 	currentBytes int64
+	stateAdapter ClusterStateAdapter
 }
 
 // NewRFC9111CacheEngine creates a new RFC 9111 edge caching engine with bounded capacity.
@@ -61,6 +65,20 @@ func NewRFC9111CacheEngine(maxEntries int, maxBytes int64) *RFC9111CacheEngine {
 	}
 	go engine.reaperWorker()
 	return engine
+}
+
+// SetStateAdapter configures the cluster state adapter for multi-tier L1 (memory) + L2 (Redis) caching.
+func (c *RFC9111CacheEngine) SetStateAdapter(adapter ClusterStateAdapter) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stateAdapter = adapter
+}
+
+// StateAdapter returns the configured cluster state adapter.
+func (c *RFC9111CacheEngine) StateAdapter() ClusterStateAdapter {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.stateAdapter
 }
 
 // NormalizeKey generates a deterministic, RFC 9111 canonical cache key.
@@ -178,24 +196,41 @@ func (c *RFC9111CacheEngine) ParseUpstreamTTL(header http.Header, defaultTTL tim
 }
 
 // Lookup searches for a fresh, non-expired cache entry.
+// Checks high-performance L1 in-memory cache first; on a miss, queries L2 distributed cluster cache.
 func (c *RFC9111CacheEngine) Lookup(key string) (*CacheEntry, bool) {
 	c.mu.RLock()
 	entry, exists := c.entries[key]
+	adapter := c.stateAdapter
 	c.mu.RUnlock()
 
-	if !exists {
-		return nil, false
-	}
-
 	now := time.Now().UTC()
-	if now.After(entry.ExpiresAt) {
-		return nil, false
+	if exists && !now.After(entry.ExpiresAt) {
+		return entry, true
 	}
 
-	return entry, true
+	// L2 Distributed Cache Check (Redis / KeyDB)
+	if adapter != nil && adapter.Name() != "memory" {
+		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		data, err := adapter.Get(ctx, "cache:"+key)
+		cancel()
+		if err == nil && len(data) > 0 {
+			var l2Entry CacheEntry
+			if err := json.Unmarshal(data, &l2Entry); err == nil {
+				if !now.After(l2Entry.ExpiresAt) {
+					// Populate local L1 cache
+					c.mu.Lock()
+					c.entries[key] = &l2Entry
+					c.mu.Unlock()
+					return &l2Entry, true
+				}
+			}
+		}
+	}
+
+	return nil, false
 }
 
-// Store caches a response, generating an ETag if not provided, and recording RFC 1123 Last-Modified.
+// Store caches a response, generating an ETag if not provided, pre-compressing compressible bodies, and recording RFC 1123 Last-Modified.
 func (c *RFC9111CacheEngine) Store(key, path string, statusCode int, header http.Header, body []byte, ttl time.Duration) *CacheEntry {
 	if ttl <= 0 {
 		return nil
@@ -217,12 +252,20 @@ func (c *RFC9111CacheEngine) Store(key, path string, statusCode int, header http
 		cachedHeaders["Content-Type"] = ctype
 	}
 
+	var gzipBody []byte
+	if IsCompressibleContentType(cachedHeaders["Content-Type"]) && len(body) >= DefaultMinCompressLength {
+		if gz, err := CompressGzip(body); err == nil && len(gz) < len(body) {
+			gzipBody = gz
+		}
+	}
+
 	entry := &CacheEntry{
 		Key:          key,
 		Path:         path,
 		StatusCode:   statusCode,
 		Headers:      cachedHeaders,
 		Body:         make([]byte, len(body)),
+		GzipBody:     gzipBody,
 		CachedAt:     now,
 		ExpiresAt:    now.Add(ttl),
 		TTL:          ttl,
@@ -231,22 +274,31 @@ func (c *RFC9111CacheEngine) Store(key, path string, statusCode int, header http
 	}
 	copy(entry.Body, body)
 
-	entryBytes := int64(len(key) + len(body) + 256)
+	entryBytes := int64(len(key) + len(body) + len(gzipBody) + 256)
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	// Enforce memory limit: evict oldest if exceeding capacity
 	if len(c.entries) >= c.maxEntries || (c.currentBytes+entryBytes) > c.maxBytes {
 		c.evictOldestLocked()
 	}
 
 	if existing, found := c.entries[key]; found {
-		c.currentBytes -= int64(len(existing.Key) + len(existing.Body) + 256)
+		c.currentBytes -= int64(len(existing.Key) + len(existing.Body) + len(existing.GzipBody) + 256)
 	}
 
 	c.entries[key] = entry
 	c.currentBytes += entryBytes
+	adapter := c.stateAdapter
+	c.mu.Unlock()
+
+	// Propagate to L2 distributed cache if configured
+	if adapter != nil && adapter.Name() != "memory" {
+		if data, err := json.Marshal(entry); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			_ = adapter.Set(ctx, "cache:"+key, data, ttl)
+			cancel()
+		}
+	}
 
 	return entry
 }
@@ -309,15 +361,21 @@ func cleanETag(tag string) string {
 // InvalidatePrefix evicts all cached items whose path starts with the specified prefix (RFC 9111 Section 4.4).
 func (c *RFC9111CacheEngine) InvalidatePrefix(pathPrefix string) int {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	evicted := 0
 	for k, entry := range c.entries {
 		if strings.HasPrefix(entry.Path, pathPrefix) {
-			c.currentBytes -= int64(len(entry.Key) + len(entry.Body) + 256)
+			c.currentBytes -= int64(len(entry.Key) + len(entry.Body) + len(entry.GzipBody) + 256)
 			delete(c.entries, k)
 			evicted++
 		}
+	}
+	adapter := c.stateAdapter
+	c.mu.Unlock()
+
+	if adapter != nil && adapter.Name() != "memory" {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		_, _ = adapter.DeletePrefix(ctx, "cache:")
+		cancel()
 	}
 	return evicted
 }
@@ -325,11 +383,17 @@ func (c *RFC9111CacheEngine) InvalidatePrefix(pathPrefix string) int {
 // PurgeAll purges every entry from the cache.
 func (c *RFC9111CacheEngine) PurgeAll() int {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	total := len(c.entries)
 	c.entries = make(map[string]*CacheEntry)
 	c.currentBytes = 0
+	adapter := c.stateAdapter
+	c.mu.Unlock()
+
+	if adapter != nil && adapter.Name() != "memory" {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		_, _ = adapter.DeletePrefix(ctx, "cache:")
+		cancel()
+	}
 	return total
 }
 
@@ -353,7 +417,7 @@ func (c *RFC9111CacheEngine) evictOldestLocked() {
 
 	if oldestKey != "" {
 		entry := c.entries[oldestKey]
-		c.currentBytes -= int64(len(entry.Key) + len(entry.Body) + 256)
+		c.currentBytes -= int64(len(entry.Key) + len(entry.Body) + len(entry.GzipBody) + 256)
 		delete(c.entries, oldestKey)
 	}
 }
@@ -374,7 +438,7 @@ func (c *RFC9111CacheEngine) evictExpired() {
 	now := time.Now().UTC()
 	for k, v := range c.entries {
 		if now.After(v.ExpiresAt) {
-			c.currentBytes -= int64(len(v.Key) + len(v.Body) + 256)
+			c.currentBytes -= int64(len(v.Key) + len(v.Body) + len(v.GzipBody) + 256)
 			delete(c.entries, k)
 		}
 	}

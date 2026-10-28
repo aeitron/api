@@ -14,18 +14,31 @@ var (
 	ErrRouteNotFound       = errors.New("route not found")
 )
 
+// HealthCheckConfig defines active health probing parameters for upstream backend instances.
+type HealthCheckConfig struct {
+	Enabled            bool          `json:"enabled"`
+	Path               string        `json:"path"`                // e.g. "/healthz"
+	Interval           time.Duration `json:"interval"`            // e.g. 10s
+	Timeout            time.Duration `json:"timeout"`             // e.g. 2s
+	UnhealthyThreshold int           `json:"unhealthy_threshold"` // consecutive failures to mark unhealthy (e.g. 2)
+	HealthyThreshold   int           `json:"healthy_threshold"`   // consecutive successes to mark healthy (e.g. 2)
+}
+
 // RouteRule specifies dynamic reverse proxy routing and security policy for a path prefix.
 type RouteRule struct {
-	PathPrefix     string        `json:"path_prefix"`
-	UpstreamURL    string        `json:"upstream_url"`
-	RewritePrefix  string        `json:"rewrite_prefix,omitempty"` // Rewrites path prefix (e.g. /v1/domains -> /v1/commerce/domains)
-	StripPrefix    bool          `json:"strip_prefix"`
-	AllowAnonymous bool          `json:"allow_anonymous"`
-	RequiredScopes []string      `json:"required_scopes,omitempty"`
-	Timeout        time.Duration `json:"timeout"`
-	RateLimitTier  string        `json:"rate_limit_tier,omitempty"` // "free", "pro", "enterprise"
-	MaxBodyBytes   int64         `json:"max_body_bytes,omitempty"`  // Max request payload in bytes (default: 1MB)
-	CacheTTL       time.Duration `json:"cache_ttl,omitempty"`       // RFC 9111 edge cache TTL (0 = bypass cache)
+	PathPrefix     string            `json:"path_prefix"`
+	UpstreamURL    string            `json:"upstream_url,omitempty"`
+	UpstreamURLs   []string          `json:"upstream_urls,omitempty"`  // Multiple backend instances for smart load balancing
+	LoadBalancer   string            `json:"load_balancer,omitempty"`  // "round_robin" (default) or "least_conn"
+	HealthCheck    HealthCheckConfig `json:"health_check,omitempty"`   // Active background health checking
+	RewritePrefix  string            `json:"rewrite_prefix,omitempty"` // Rewrites path prefix (e.g. /v1/domains -> /v1/commerce/domains)
+	StripPrefix    bool              `json:"strip_prefix"`
+	AllowAnonymous bool              `json:"allow_anonymous"`
+	RequiredScopes []string          `json:"required_scopes,omitempty"`
+	Timeout        time.Duration     `json:"timeout"`
+	RateLimitTier  string            `json:"rate_limit_tier,omitempty"` // "free", "pro", "enterprise"
+	MaxBodyBytes   int64             `json:"max_body_bytes,omitempty"`  // Max request payload in bytes (default: 1MB)
+	CacheTTL       time.Duration     `json:"cache_ttl,omitempty"`       // RFC 9111 edge cache TTL (0 = bypass cache)
 }
 
 // TenantContext contains verified tenant and actor identity extracted from credentials.
@@ -36,7 +49,8 @@ type TenantContext struct {
 	ActorID   string    `json:"actor_id"`
 	Role      string    `json:"role"`
 	Scopes    []string  `json:"scopes"`
-	Tier      string    `json:"tier"` // "free", "pro", "enterprise"
+	Tier      string    `json:"tier"`     // "free", "pro", "enterprise"
+	Livemode  bool      `json:"livemode"` // true for live production keys, false for sandbox/test keys
 	ExpiresAt time.Time `json:"expires_at"`
 }
 

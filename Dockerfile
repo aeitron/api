@@ -4,6 +4,7 @@ FROM golang:1.24-alpine AS builder
 WORKDIR /app
 COPY go.mod ./
 COPY *.go ./
+COPY openapi.yaml ./
 COPY cmd/ ./cmd/
 
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/bin/api-gateway ./cmd/api-gateway

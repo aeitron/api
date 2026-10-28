@@ -25,3 +25,9 @@ jobs:
 
       - name: Run Tests
         run: go test -v -race ./...
+
+      - name: Verify OpenAPI Contract
+        run: npx --yes @redocly/cli lint openapi.yaml
+
+      - name: Verify Docker Container Build
+        run: docker build -t aeitron-api-gateway:ci .

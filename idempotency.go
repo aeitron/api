@@ -1,6 +1,7 @@
 package apigateway
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -40,9 +41,10 @@ type IdempotencyRecord struct {
 
 // IdempotencyEngine manages concurrent locking, payload validation, and replay caching for mutating requests.
 type IdempotencyEngine struct {
-	mu      sync.RWMutex
-	records map[string]*IdempotencyRecord
-	ttl     time.Duration
+	mu           sync.RWMutex
+	records      map[string]*IdempotencyRecord
+	ttl          time.Duration
+	stateAdapter ClusterStateAdapter
 }
 
 // NewIdempotencyEngine creates an IdempotencyEngine with a default 24-hour TTL (Stripe standard).
@@ -56,6 +58,20 @@ func NewIdempotencyEngine(ttl time.Duration) *IdempotencyEngine {
 	}
 	go engine.reaperWorker()
 	return engine
+}
+
+// SetStateAdapter configures the cluster state adapter for distributed idempotency synchronization.
+func (ie *IdempotencyEngine) SetStateAdapter(adapter ClusterStateAdapter) {
+	ie.mu.Lock()
+	defer ie.mu.Unlock()
+	ie.stateAdapter = adapter
+}
+
+// StateAdapter returns the configured cluster state adapter.
+func (ie *IdempotencyEngine) StateAdapter() ClusterStateAdapter {
+	ie.mu.RLock()
+	defer ie.mu.RUnlock()
+	return ie.stateAdapter
 }
 
 // ComputePayloadHash returns the SHA-256 fingerprint of the HTTP method, path, and request body.
@@ -90,6 +106,28 @@ func (ie *IdempotencyEngine) AcquireOrReplay(tenantID, key, method, path string,
 
 	payloadHash := ComputePayloadHash(method, path, bodyBytes)
 	scopedKey := tenantID + ":" + key
+
+	// If distributed cluster state adapter configured and not local memory, synchronize cluster-wide
+	ie.mu.RLock()
+	adapter := ie.stateAdapter
+	ie.mu.RUnlock()
+
+	if adapter != nil && adapter.Name() != "memory" {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		acquired, existing, err := adapter.IdempotencyAcquire(ctx, scopedKey, payloadHash, ie.ttl)
+		cancel()
+		if err == nil {
+			if !acquired && existing != nil {
+				if existing.RequestHash != payloadHash {
+					return nil, false, ErrIdempotencyMismatch
+				}
+				if existing.State == "COMPLETED" {
+					return existing, true, nil
+				}
+				return nil, false, ErrIdempotencyInFlight
+			}
+		}
+	}
 
 	ie.mu.Lock()
 	now := time.Now().UTC()
@@ -161,10 +199,9 @@ func (ie *IdempotencyEngine) Complete(tenantID, key string, statusCode int, head
 	scopedKey := tenantID + ":" + key
 
 	ie.mu.Lock()
-	defer ie.mu.Unlock()
-
 	rec, exists := ie.records[scopedKey]
 	if !exists || rec.State == "COMPLETED" {
+		ie.mu.Unlock()
 		return
 	}
 
@@ -179,6 +216,15 @@ func (ie *IdempotencyEngine) Complete(tenantID, key string, statusCode int, head
 
 	rec.State = "COMPLETED"
 	close(rec.Done)
+	adapter := ie.stateAdapter
+	ie.mu.Unlock()
+
+	// Synchronize completion to distributed cluster state adapter
+	if adapter != nil && adapter.Name() != "memory" {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		_ = adapter.IdempotencyComplete(ctx, scopedKey, rec, ie.ttl)
+		cancel()
+	}
 }
 
 // Abort cancels an in-flight record if an upstream proxy failure occurs.
@@ -186,12 +232,19 @@ func (ie *IdempotencyEngine) Abort(tenantID, key string) {
 	scopedKey := tenantID + ":" + key
 
 	ie.mu.Lock()
-	defer ie.mu.Unlock()
-
 	rec, exists := ie.records[scopedKey]
 	if exists && rec.State == "IN_FLIGHT" {
 		delete(ie.records, scopedKey)
 		close(rec.Done)
+	}
+	adapter := ie.stateAdapter
+	ie.mu.Unlock()
+
+	// Synchronize abort to distributed cluster state adapter
+	if adapter != nil && adapter.Name() != "memory" {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		_ = adapter.IdempotencyAbort(ctx, scopedKey)
+		cancel()
 	}
 }
 

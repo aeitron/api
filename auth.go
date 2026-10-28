@@ -2,8 +2,10 @@ package apigateway
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -22,7 +24,13 @@ type Authenticator struct {
 // NewAuthenticator creates an Authenticator with a configured signing secret.
 func NewAuthenticator(jwtSecret string) *Authenticator {
 	if jwtSecret == "" {
-		jwtSecret = "aeitron-default-secret-key-change-in-production-32bytes"
+		// Generate an ephemeral random 32-byte secret instead of using a predictable fixed string
+		randomSecretBytes := make([]byte, 32)
+		if _, err := rand.Read(randomSecretBytes); err == nil {
+			jwtSecret = hex.EncodeToString(randomSecretBytes)
+		} else {
+			jwtSecret = "aeitron-fallback-secret-key-min-32bytes"
+		}
 	}
 	return &Authenticator{
 		jwtSecret: []byte(jwtSecret),
@@ -59,30 +67,67 @@ func (a *Authenticator) AuthenticateRequest(r *http.Request) (*TenantContext, er
 		return nil, ErrUnauthorized
 	}
 
-	// 1. Check if token is a Scoped API Key (prefixed with aeitron_live_ or aeitron_test_)
-	if strings.HasPrefix(rawToken, "aeitron_live_") || strings.HasPrefix(rawToken, "aeitron_test_") {
+	// 1. Check if token is a Scoped API Key (prefixed with aeitron_live_, aeitron_test_, ak_live_, ak_test_)
+	if strings.HasPrefix(rawToken, "aeitron_live_") || strings.HasPrefix(rawToken, "aeitron_test_") ||
+		strings.HasPrefix(rawToken, "ak_live_") || strings.HasPrefix(rawToken, "ak_test_") {
 		return a.validateAPIKey(rawToken)
 	}
 
 	// 2. Otherwise validate as JWT Token (header.payload.signature)
-	return a.validateJWT(rawToken)
+	ctx, err := a.validateJWT(rawToken)
+	if err == nil && ctx != nil {
+		if strings.EqualFold(r.Header.Get("Aeitron-Livemode"), "false") || strings.EqualFold(r.Header.Get("X-Aeitron-Simulate"), "true") {
+			ctx.Livemode = false
+		}
+	}
+	return ctx, err
 }
 
 func (a *Authenticator) validateAPIKey(key string) (*TenantContext, error) {
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-
 	ctx, exists := a.apiKeys[key]
-	if !exists {
-		return nil, ErrUnauthorized
+	a.mu.RUnlock()
+
+	isTestPrefix := strings.HasPrefix(key, "aeitron_test_") || strings.HasPrefix(key, "ak_test_")
+
+	if exists {
+		if !ctx.ExpiresAt.IsZero() && time.Now().UTC().After(ctx.ExpiresAt) {
+			return nil, fmt.Errorf("%w: API key has expired", ErrUnauthorized)
+		}
+		cp := *ctx
+		if isTestPrefix {
+			cp.Livemode = false
+		} else if strings.HasPrefix(key, "aeitron_live_") || strings.HasPrefix(key, "ak_live_") {
+			cp.Livemode = true
+		}
+		return &cp, nil
 	}
 
-	if !ctx.ExpiresAt.IsZero() && time.Now().UTC().After(ctx.ExpiresAt) {
-		return nil, fmt.Errorf("%w: API key has expired", ErrUnauthorized)
+	// Auto-provision hermetic sandbox tenant for developer test keys (aeitron_test_... / ak_test_...)
+	if isTestPrefix {
+		tenantID := "test_sandbox"
+		parts := strings.Split(key, "_")
+		if len(parts) >= 3 && parts[2] != "" {
+			tenantID = "test_" + parts[2]
+		}
+		limit := len(key)
+		if limit > 24 {
+			limit = 24
+		}
+		return &TenantContext{
+			TenantID:  tenantID,
+			OrgID:     "org_sandbox",
+			ProjectID: "proj_sandbox",
+			ActorID:   "act_" + key[:limit],
+			Role:      "developer",
+			Scopes:    []string{"*"},
+			Tier:      "enterprise",
+			Livemode:  false,
+			ExpiresAt: time.Now().UTC().Add(365 * 24 * time.Hour),
+		}, nil
 	}
 
-	cp := *ctx
-	return &cp, nil
+	return nil, ErrUnauthorized
 }
 
 // JWTClaims represents standard and custom Aeitron claims.
@@ -94,6 +139,7 @@ type JWTClaims struct {
 	Role      string   `json:"role"`
 	Scopes    []string `json:"scopes"`
 	Tier      string   `json:"tier"`
+	Livemode  *bool    `json:"livemode,omitempty"`
 	Exp       int64    `json:"exp"`
 }
 
@@ -103,7 +149,26 @@ func (a *Authenticator) validateJWT(token string) (*TenantContext, error) {
 		return nil, fmt.Errorf("%w: invalid JWT format", ErrUnauthorized)
 	}
 
-	// Verify HMAC-SHA256 signature
+	// 1. Decode and strictly validate JWT Header (mitigate 'none' alg or algorithm confusion)
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("%w: malformed token header", ErrUnauthorized)
+	}
+	var header struct {
+		Alg string `json:"alg"`
+		Typ string `json:"typ"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil, fmt.Errorf("%w: invalid token header json", ErrUnauthorized)
+	}
+	if !strings.EqualFold(header.Alg, "HS256") {
+		return nil, fmt.Errorf("%w: unsupported token algorithm '%s', only HS256 is accepted", ErrUnauthorized, header.Alg)
+	}
+	if header.Typ != "" && !strings.EqualFold(header.Typ, "JWT") {
+		return nil, fmt.Errorf("%w: invalid token type '%s', expected JWT", ErrUnauthorized, header.Typ)
+	}
+
+	// 2. Verify HMAC-SHA256 signature
 	dataToSign := parts[0] + "." + parts[1]
 	mac := hmac.New(sha256.New, a.jwtSecret)
 	mac.Write([]byte(dataToSign))
@@ -113,7 +178,7 @@ func (a *Authenticator) validateJWT(token string) (*TenantContext, error) {
 		return nil, fmt.Errorf("%w: invalid token signature", ErrUnauthorized)
 	}
 
-	// Decode payload
+	// 3. Decode and validate claims payload
 	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		return nil, fmt.Errorf("%w: malformed token payload", ErrUnauthorized)
@@ -124,14 +189,27 @@ func (a *Authenticator) validateJWT(token string) (*TenantContext, error) {
 		return nil, fmt.Errorf("%w: malformed token claims", ErrUnauthorized)
 	}
 
-	// Verify expiration
-	if claims.Exp > 0 && time.Now().UTC().Unix() > claims.Exp {
+	// Enforce non-zero expiration timestamp
+	if claims.Exp <= 0 {
+		return nil, fmt.Errorf("%w: token must include a non-zero exp timestamp", ErrUnauthorized)
+	}
+	if time.Now().UTC().Unix() > claims.Exp {
 		return nil, fmt.Errorf("%w: token expired", ErrUnauthorized)
+	}
+
+	// Enforce required tenant identification
+	if strings.TrimSpace(claims.TenantID) == "" {
+		return nil, fmt.Errorf("%w: token missing required tenant_id claim", ErrUnauthorized)
 	}
 
 	tier := claims.Tier
 	if tier == "" {
 		tier = "free"
+	}
+
+	livemode := true
+	if claims.Livemode != nil {
+		livemode = *claims.Livemode
 	}
 
 	return &TenantContext{
@@ -142,6 +220,7 @@ func (a *Authenticator) validateJWT(token string) (*TenantContext, error) {
 		Role:      claims.Role,
 		Scopes:    claims.Scopes,
 		Tier:      tier,
+		Livemode:  livemode,
 		ExpiresAt: time.Unix(claims.Exp, 0).UTC(),
 	}, nil
 }

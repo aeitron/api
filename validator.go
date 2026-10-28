@@ -88,6 +88,38 @@ func ValidateSafeTargetURL(rawURL string) error {
 	return nil
 }
 
+// ValidateSafeUpstreamURL validates an upstream backend target URL before creating a proxy pool.
+// It verifies safe scheme (http/https), valid hostname, and unconditionally blocks cloud metadata endpoints (169.254.169.254, metadata.google.internal).
+func ValidateSafeUpstreamURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid upstream URL: %w", err)
+	}
+
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("unsupported upstream URL scheme '%s': only http and https are permitted", scheme)
+	}
+
+	hostname := u.Hostname()
+	if hostname == "" {
+		return errors.New("missing hostname in upstream URL")
+	}
+
+	// Unconditionally reject cloud metadata endpoints in all environments
+	if hostname == "169.254.169.254" || hostname == "metadata.google.internal" || hostname == "instance-data" {
+		return errors.New("upstream URL targeting cloud provider instance metadata is prohibited")
+	}
+
+	// In production, validate safe target URL (reject unapproved destination ranges)
+	isProd := strings.EqualFold(os.Getenv("AEITRON_ENV"), "production") || strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "false")
+	if isProd {
+		return ValidateSafeTargetURL(rawURL)
+	}
+
+	return nil
+}
+
 func isPrivateIP(ip net.IP) bool {
 	if ip == nil {
 		return true

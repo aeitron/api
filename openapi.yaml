@@ -108,6 +108,222 @@ paths:
                     items:
                       $ref: '#/components/schemas/RouteRule'
 
+  /v1/gateway/upstreams:
+    get:
+      summary: Upstream Pools & Active Health Check Telemetry
+      description: |
+        Returns the real-time operational status of all load-balanced upstream pools,
+        including configured algorithms (round_robin, least_conn), individual node health,
+        active in-flight connection counts, latencies, and circuit breaker states.
+      responses:
+        '200':
+          description: Live upstream pool status and node health
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  upstreams:
+                    type: object
+
+  /v1/gateway/cluster:
+    get:
+      summary: Distributed Cluster State Adapter Telemetry
+      description: |
+        Returns the real-time operational status of the distributed state synchronization adapter
+        (memory or redis/KeyDB), ping latency, cluster mode, and distributed error counts.
+      responses:
+        '200':
+          description: Live cluster state adapter operational status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode:
+                    type: string
+                    example: redis
+                  status:
+                    type: string
+                    example: connected
+                  ping_latency_micros:
+                    type: integer
+                    example: 120
+                  cluster_errors:
+                    type: integer
+                    example: 0
+                  redis_addr:
+                    type: string
+                    example: 127.0.0.1:6379
+
+  /v1/gateway/traces:
+    get:
+      summary: List Recent Distributed Traces
+      description: |
+        Returns recent W3C distributed traces recorded in the in-memory circular ring buffer.
+        Supports filtering by minimum latency duration (e.g. min_duration_ms=50 for slow trace identification), status code, and result limit.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 500
+        - name: min_duration_ms
+          in: query
+          description: Filter traces exceeding this duration in milliseconds
+          schema:
+            type: integer
+            example: 50
+        - name: status
+          in: query
+          description: Filter traces by HTTP response status code
+          schema:
+            type: integer
+            example: 500
+      responses:
+        '200':
+          description: List of matching distributed traces with lifecycle metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  traces:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TraceContext'
+                  stats:
+                    $ref: '#/components/schemas/TracingStats'
+
+  /v1/gateway/traces/slow:
+    get:
+      summary: List Latency-Degraded Traces (>50ms)
+      description: |
+        Rapidly isolates slow requests exceeding the gateway latency budget (default >50ms).
+        Enables instant root-cause analysis across gateway ingress, auth, cache, and upstream stages.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Latency-degraded traces
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  slow_threshold_ms:
+                    type: integer
+                  total_slow_detected:
+                    type: integer
+                  slow_traces:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TraceContext'
+
+  /v1/gateway/traces/stats:
+    get:
+      summary: Distributed Tracing Ring Buffer Stats
+      description: Returns buffer utilization, captured trace count, capacity, and active sampling rate.
+      responses:
+        '200':
+          description: Tracing engine operational metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TracingStats'
+
+  /v1/gateway/traces/config:
+    post:
+      summary: Dynamic Tracing Configuration
+      description: Dynamically tunes trace sampling probability (0.0 to 1.0) and slow threshold without restarts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sampling_rate:
+                  type: number
+                  minimum: 0.0
+                  maximum: 1.0
+                  example: 0.5
+                slow_threshold_ms:
+                  type: integer
+                  minimum: 1
+                  example: 50
+      responses:
+        '200':
+          description: Updated configuration
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  stats:
+                    $ref: '#/components/schemas/TracingStats'
+
+  /v1/gateway/traces/{trace_id}:
+    get:
+      summary: Detailed Trace with Full Span Hierarchy
+      description: Retrieves complete microsecond span timeline for a trace (Ingress -> RateLimit -> Auth -> Cache -> Upstream -> Egress).
+      parameters:
+        - name: trace_id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: 4bf92f3577b34da6a3ce929d0e0e4736
+      responses:
+        '200':
+          description: Trace detail with all spans, microsecond timings, attributes, and events
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TraceContext'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /v1/gateway/traces/{trace_id}/export:
+    get:
+      summary: Export Trace to OpenTelemetry, Jaeger, or Zipkin
+      description: |
+        Exports trace data in standard OpenTelemetry (OTLP v1 JSON), Jaeger UI/Ingestion JSON, or Zipkin v2 format.
+        Directly consumable by Jaeger collector, Zipkin server, Datadog Agent, or OpenTelemetry Collector.
+      parameters:
+        - name: trace_id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: 4bf92f3577b34da6a3ce929d0e0e4736
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [otlp, jaeger, zipkin]
+            default: otlp
+      responses:
+        '200':
+          description: Exported trace representation in requested standard format
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
   /v1/auth/token:
     post:
       summary: Fast API-Key Token Exchange or JWT Issuance
@@ -136,6 +352,446 @@ paths:
                 $ref: '#/components/schemas/TokenResponse'
         '401':
           $ref: '#/components/responses/UnauthorizedError'
+
+  /v1/sandbox/state:
+    get:
+      summary: Inspect Sandboxed Test Infrastructure State
+      description: Returns all mock orders, microVMs, DNS zones, and buckets created within the tenant's isolated sandbox.
+      responses:
+        '200':
+          description: Active sandbox fixtures
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  livemode:
+                    type: boolean
+                    example: false
+                  tenant_id:
+                    type: string
+                  state:
+                    type: object
+
+  /v1/sandbox/reset:
+    post:
+      summary: Reset Sandboxed Environment
+      description: Clears all mock infrastructure fixtures, test orders, and simulated resources for the tenant.
+      responses:
+        '200':
+          description: Sandbox successfully reset
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: sandbox_reset_success
+                  livemode:
+                    type: boolean
+                    example: false
+
+  /v1/sandbox/config:
+    get:
+      summary: Get Sandbox Simulation Configuration
+      description: Returns test card numbers, simulated boot latency, and mock IP subnets for development testing.
+      responses:
+        '200':
+          description: Sandbox mock environment configuration
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  livemode:
+                    type: boolean
+                    example: false
+                  test_card_numbers:
+                    type: array
+                    items:
+                      type: string
+                  test_network_range:
+                    type: string
+                    example: 198.51.100.0/24 (RFC 5737 Test-Net)
+
+  /v1/webhooks/subscriptions:
+    post:
+      summary: Register Webhook Subscription
+      description: |
+        Registers an asynchronous webhook destination endpoint with Stripe-style HMAC-SHA256 signature verification.
+        Validates target URLs against Server-Side Request Forgery (SSRF) attacks.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+                  example: https://app.example.com/api/webhooks/aeitron
+                events:
+                  type: array
+                  items:
+                    type: string
+                  example: ["deployment.*", "invoice.paid", "ddos.detected"]
+                secret:
+                  type: string
+                  description: Optional custom signing secret (auto-generated if omitted)
+                  example: whsec_9a8b7c6d5e4f3a2b1c0d
+                active:
+                  type: boolean
+                  default: true
+      responses:
+        '201':
+          description: Webhook subscription successfully registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription:
+                    $ref: '#/components/schemas/WebhookSubscription'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+
+    get:
+      summary: List Webhook Subscriptions
+      description: Returns all active and inactive webhook subscriptions for the authenticated tenant.
+      responses:
+        '200':
+          description: List of registered webhook subscriptions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscriptions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WebhookSubscription'
+                  count:
+                    type: integer
+
+  /v1/webhooks/subscriptions/{id}:
+    get:
+      summary: Retrieve Webhook Subscription
+      description: Returns subscription metadata, configured events, and signing secret.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: sub_a1b2c3d4e5f6
+      responses:
+        '200':
+          description: Subscription details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription:
+                    $ref: '#/components/schemas/WebhookSubscription'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+    delete:
+      summary: Delete Webhook Subscription
+      description: Permanently deactivates and removes a webhook subscription.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: sub_a1b2c3d4e5f6
+      responses:
+        '200':
+          description: Subscription deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: deleted
+                  id:
+                    type: string
+                    example: sub_a1b2c3d4e5f6
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /v1/webhooks/dispatch:
+    post:
+      summary: Dispatch Asynchronous Cloud Event
+      description: |
+        Matches an event type against registered tenant subscriptions and enqueues
+        asynchronous webhook deliveries with HMAC-SHA256 signatures and exponential backoff retry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type]
+              properties:
+                id:
+                  type: string
+                  example: evt_123456789abc
+                type:
+                  type: string
+                  example: deployment.succeeded
+                tenant_id:
+                  type: string
+                data:
+                  type: object
+                  example:
+                    deployment_id: dep_xyz
+                    environment: production
+      responses:
+        '202':
+          description: Cloud event dispatched to subscriber delivery queues
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: dispatched
+                  event_id:
+                    type: string
+                  event_type:
+                    type: string
+                  count:
+                    type: integer
+                  deliveries:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WebhookDelivery'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+
+  /v1/webhooks/deliveries:
+    get:
+      summary: List Recent Webhook Deliveries
+      description: Returns recent webhook delivery attempts, status codes, latencies, and retry statuses.
+      responses:
+        '200':
+          description: List of webhook deliveries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WebhookDelivery'
+                  count:
+                    type: integer
+
+  /v1/webhooks/dead-letter:
+    get:
+      summary: List Dead-Letter Queue (DLQ) Items
+      description: Returns deliveries that permanently failed all exponential backoff retry attempts.
+      responses:
+        '200':
+          description: Failed deliveries in Dead-Letter Queue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dead_letters:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DeadLetterItem'
+                  count:
+                    type: integer
+
+  /v1/webhooks/dead-letter/retry:
+    post:
+      summary: Manually Redeliver Failed Webhook from DLQ
+      description: Resets attempt count and immediately re-enqueues a dead-letter item for delivery.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [delivery_id]
+              properties:
+                delivery_id:
+                  type: string
+                  example: del_9a8b7c6d5e4f
+      responses:
+        '200':
+          description: Redelivery successfully scheduled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: redelivery_scheduled
+                  delivery:
+                    $ref: '#/components/schemas/WebhookDelivery'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /v1/webhooks/test:
+    post:
+      summary: Simulate Live Webhook Dispatch
+      description: |
+        Dispatches a test event synchronously to an arbitrary destination URL with
+        live HMAC-SHA256 signature generation and returns the complete delivery diagnostic details.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TestWebhookRequest'
+      responses:
+        '200':
+          description: Webhook simulation result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestDeliveryResult'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+
+  /v1/webhooks/portal:
+    get:
+      summary: Interactive Webhooks Developer Portal HUD
+      description: |
+        Serves the embedded reactive Webhooks HUD interface with interactive simulation tester,
+        real-time deliveries stream, dead-letter queue management, and code snippets.
+      security: []
+      responses:
+        '200':
+          description: Webhooks Developer Portal HTML interface
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/events/stream:
+    get:
+      summary: Real-Time Infrastructure Events Stream (Server-Sent Events)
+      description: |
+        Streams real-time infrastructure lifecycle events over standard W3C Server-Sent Events (SSE).
+        Supports topic filtering (`?topics=compute.instances,dns.health`), event types (`?events=...`),
+        and transparent historical replay via `Last-Event-ID`.
+      parameters:
+        - name: topics
+          in: query
+          description: Comma-separated list of topics or wildcards (e.g. `compute.*,dns.health`)
+          required: false
+          schema:
+            type: string
+            example: compute.instances,dns.health
+        - name: events
+          in: query
+          description: Comma-separated list of specific event types
+          required: false
+          schema:
+            type: string
+        - name: Last-Event-ID
+          in: header
+          description: ID of the last successfully received event for automatic replay
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: W3C Server-Sent Events continuous text stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: |
+                  id: evt_123456
+                  event: compute.instances
+                  data: {"instance_id": "vm-99824", "status": "running"}
+
+  /v1/events/publish:
+    post:
+      summary: Publish Infrastructure Lifecycle Event
+      description: |
+        Broadcasts an infrastructure event to all active real-time SSE subscribers and
+        records it in the circular ring buffer for reconnection replay.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InfrastructureEvent'
+      responses:
+        '202':
+          description: Event successfully accepted for broadcast
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: published
+                  event_id:
+                    type: string
+                  topic:
+                    type: string
+                  type:
+                    type: string
+                  timestamp:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+
+  /v1/events/history:
+    get:
+      summary: Query Recent Event Ring Buffer History
+      description: Retrieves recent infrastructure events from the high-performance memory ring buffer.
+      parameters:
+        - name: topic
+          in: query
+          description: Optional topic filter or wildcard pattern
+          required: false
+          schema:
+            type: string
+            example: compute.instances
+        - name: limit
+          in: query
+          description: Maximum number of events to return (max 500)
+          required: false
+          schema:
+            type: integer
+            default: 50
+            example: 20
+      responses:
+        '200':
+          description: Historical events list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/InfrastructureEvent'
+                  count:
+                    type: integer
 
   /v1/catalog:
     get:
@@ -803,7 +1459,265 @@ components:
         error:
           type: string
 
+    WebhookSubscription:
+      type: object
+      properties:
+        id:
+          type: string
+          example: sub_123456789abc
+        tenant_id:
+          type: string
+          example: tenant_corp
+        url:
+          type: string
+          example: https://app.example.com/webhooks
+        events:
+          type: array
+          items:
+            type: string
+          example: ["deployment.*", "invoice.paid"]
+        secret:
+          type: string
+          example: whsec_0123456789abcdef0123456789abcdef
+        active:
+          type: boolean
+          example: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    WebhookDelivery:
+      type: object
+      properties:
+        id:
+          type: string
+          example: del_123456789abc
+        subscription_id:
+          type: string
+          example: sub_123456789abc
+        tenant_id:
+          type: string
+          example: tenant_corp
+        event_id:
+          type: string
+          example: evt_123456789abc
+        event_type:
+          type: string
+          example: deployment.succeeded
+        url:
+          type: string
+          example: https://app.example.com/webhooks
+        attempt:
+          type: integer
+          example: 1
+        max_attempts:
+          type: integer
+          example: 3
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [pending, success, retrying, dead_letter]
+          example: success
+        duration_ms:
+          type: integer
+          example: 45
+        created_at:
+          type: string
+          format: date-time
+
+    DeadLetterItem:
+      type: object
+      properties:
+        delivery:
+          $ref: '#/components/schemas/WebhookDelivery'
+        event:
+          type: object
+        subscription:
+          $ref: '#/components/schemas/WebhookSubscription'
+        failed_at:
+          type: string
+          format: date-time
+        reason:
+          type: string
+          example: HTTP 500
+
+    TestWebhookRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          example: https://app.example.com/api/webhooks/test
+        secret:
+          type: string
+          example: whsec_test_secret_key
+        event_type:
+          type: string
+          example: compute.instance.created
+        data:
+          type: object
+          example:
+            instance_id: vm-99824
+            status: running
+
+    TestDeliveryResult:
+      type: object
+      properties:
+        url:
+          type: string
+        event_type:
+          type: string
+        status_code:
+          type: integer
+        success:
+          type: boolean
+        duration_ms:
+          type: integer
+        request_body:
+          type: string
+        response_body:
+          type: string
+        signature:
+          type: string
+        timestamp:
+          type: string
+        headers_sent:
+          type: object
+          additionalProperties:
+            type: string
+        error:
+          type: string
+
+    InfrastructureEvent:
+      type: object
+      required: [topic, type]
+      properties:
+        id:
+          type: string
+          example: evt_1730100000_a1b2c3
+        topic:
+          type: string
+          example: compute.instances
+        type:
+          type: string
+          example: instance.provisioned
+        tenant_id:
+          type: string
+          example: tenant_corp
+        timestamp:
+          type: string
+          format: date-time
+        data:
+          type: object
+          example:
+            instance_id: vm-99824
+            region: us-east-1
+
+    TraceContext:
+      type: object
+      properties:
+        trace_id:
+          type: string
+          example: 4bf92f3577b34da6a3ce929d0e0e4736
+        span_id:
+          type: string
+          example: 00f067aa0ba902b7
+        parent_span_id:
+          type: string
+        trace_flags:
+          type: string
+          example: "01"
+        trace_state:
+          type: string
+          example: aeitron=gateway
+        sampled:
+          type: boolean
+        method:
+          type: string
+          example: GET
+        path:
+          type: string
+          example: /v1/orders
+        status_code:
+          type: integer
+          example: 200
+        start_time:
+          type: string
+          format: date-time
+        duration_micros:
+          type: integer
+          example: 12500
+        spans:
+          type: array
+          items:
+            $ref: '#/components/schemas/Span'
+
+    Span:
+      type: object
+      properties:
+        trace_id:
+          type: string
+        span_id:
+          type: string
+        parent_span_id:
+          type: string
+        name:
+          type: string
+          example: gateway.upstream
+        kind:
+          type: string
+          enum: [SERVER, CLIENT, INTERNAL]
+        duration_micros:
+          type: integer
+          example: 4500
+        status_code:
+          type: integer
+          example: 200
+        attributes:
+          type: object
+          additionalProperties:
+            type: string
+
+    TracingStats:
+      type: object
+      properties:
+        captured_traces:
+          type: integer
+          example: 1542
+        max_capacity:
+          type: integer
+          example: 10000
+        sampling_rate:
+          type: number
+          example: 1.0
+        slow_threshold_ms:
+          type: integer
+          example: 50
+        slow_traces_total:
+          type: integer
+          example: 14
+
   responses:
+    BadRequestError:
+      description: Invalid request payload or parameter format
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+    NotFoundError:
+      description: Requested resource was not found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
     UnauthorizedError:
       description: Authentication failed or token missing/expired
       content:
@@ -853,6 +1767,18 @@ components:
             example: HIT
 
   parameters:
+    AeitronVersionHeader:
+      name: Aeitron-Version
+      in: header
+      description: |
+        Stripe-grade date-based API version requested by client (e.g. 2026-11-01).
+        When omitted, defaults to the account's pinned or server-authoritative baseline version (2026-11-01).
+      required: false
+      schema:
+        type: string
+        pattern: '^\d{4}-\d{2}-\d{2}$'
+        example: '2026-11-01'
+
     IdempotencyKeyHeader:
       name: Idempotency-Key
       in: header
@@ -874,3 +1800,24 @@ components:
       schema:
         type: string
         example: W/"aei_7a8b9c0d1e"
+
+    AcceptEncodingHeader:
+      name: Accept-Encoding
+      in: header
+      description: |
+        Client-supported compression algorithms (e.g. gzip, deflate, br). Gateway will automatically stream-compress responses >= 512 bytes on the fly or serve pre-compressed RFC 9111 cache representations.
+      required: false
+      schema:
+        type: string
+        example: gzip, deflate, br
+
+    LivemodeHeader:
+      name: Aeitron-Livemode
+      in: header
+      description: |
+        Stripe-grade livemode indicator. Returns 'true' when operating with production credentials,
+        and 'false' when in live test sandbox mode (e.g. aeitron_test_... API keys).
+      required: false
+      schema:
+        type: boolean
+        example: false
