@@ -2267,17 +2267,20 @@ func TestWebhook_SubscriptionManagement(t *testing.T) {
 
 func TestWebhook_AsynchronousDelivery(t *testing.T) {
 	t.Setenv("AEITRON_DEV_MODE", "true")
+	var mu sync.Mutex
 	var receivedSig, receivedTs, receivedDelID, receivedEvtType, receivedUA string
 	var receivedPayload []byte
 	receivedCh := make(chan struct{}, 1)
 
 	webhookListener := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		receivedSig = r.Header.Get("X-Aeitron-Signature")
 		receivedTs = r.Header.Get("X-Aeitron-Timestamp")
 		receivedDelID = r.Header.Get("X-Aeitron-Delivery-ID")
 		receivedEvtType = r.Header.Get("X-Aeitron-Event-Type")
 		receivedUA = r.Header.Get("User-Agent")
 		receivedPayload, _ = io.ReadAll(r.Body)
+		mu.Unlock()
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"received":true}`))
@@ -2336,24 +2339,33 @@ func TestWebhook_AsynchronousDelivery(t *testing.T) {
 	}
 
 	// Verify headers
-	if !strings.HasPrefix(receivedSig, "sha256=") {
-		t.Fatalf("expected sha256= prefix in signature, got %s", receivedSig)
+	mu.Lock()
+	sig := receivedSig
+	ts := receivedTs
+	delID := receivedDelID
+	evtType := receivedEvtType
+	ua := receivedUA
+	payload := append([]byte(nil), receivedPayload...)
+	mu.Unlock()
+
+	if !strings.HasPrefix(sig, "sha256=") {
+		t.Fatalf("expected sha256= prefix in signature, got %s", sig)
 	}
-	if receivedTs == "" {
+	if ts == "" {
 		t.Fatal("expected timestamp header")
 	}
-	if !strings.HasPrefix(receivedDelID, "del_") {
-		t.Fatalf("expected del_ prefix in delivery ID, got %s", receivedDelID)
+	if !strings.HasPrefix(delID, "del_") {
+		t.Fatalf("expected del_ prefix in delivery ID, got %s", delID)
 	}
-	if receivedEvtType != "deployment.succeeded" {
-		t.Fatalf("expected event type deployment.succeeded, got %s", receivedEvtType)
+	if evtType != "deployment.succeeded" {
+		t.Fatalf("expected event type deployment.succeeded, got %s", evtType)
 	}
-	if !strings.Contains(receivedUA, "Aeitron-Webhook-Delivery") {
-		t.Fatalf("expected User-Agent Aeitron-Webhook-Delivery, got %s", receivedUA)
+	if !strings.Contains(ua, "Aeitron-Webhook-Delivery") {
+		t.Fatalf("expected User-Agent Aeitron-Webhook-Delivery, got %s", ua)
 	}
 
 	// Verify signature using the engine signer
-	if err := engine.Signer().Verify(sub.Secret, receivedPayload, receivedSig, receivedTs); err != nil {
+	if err := engine.Signer().Verify(sub.Secret, payload, sig, ts); err != nil {
 		t.Fatalf("signature verification failed on received payload: %v", err)
 	}
 

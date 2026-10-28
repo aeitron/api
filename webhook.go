@@ -462,7 +462,8 @@ func (e *WebhookEngine) Dispatch(event WebhookEvent) ([]*WebhookDelivery, error)
 			e.deliveries = e.deliveries[len(e.deliveries)-1000:]
 		}
 
-		deliveries = append(deliveries, del)
+		delCopy := *del
+		deliveries = append(deliveries, &delCopy)
 
 		job := deliveryJob{
 			sub:        sub,
