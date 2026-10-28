@@ -12,7 +12,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/bin/api
 FROM alpine:3.20
 
 RUN apk --no-cache add ca-certificates tzdata && \
-    addgroup -S aeitron && adduser -S aeitron -G aeitron
+    addgroup -S aeitron && adduser -S aeitron -G aeitron && \
+    mkdir -p /var/log/aeitron && chown -R aeitron:aeitron /var/log/aeitron
 
 WORKDIR /home/aeitron
 COPY --from=builder /app/bin/api-gateway /usr/local/bin/api-gateway

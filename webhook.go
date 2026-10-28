@@ -226,8 +226,8 @@ func SafeDialContext(isDev bool) func(ctx context.Context, network, addr string)
 		}
 
 		// Reject cloud provider metadata endpoints unconditionally
-		if host == "169.254.169.254" || host == "metadata.google.internal" || host == "instance-data" {
-			return nil, errors.New("connection to cloud provider instance metadata is prohibited (SSRF defense)")
+		if isCloudMetadataHost(host) {
+			return nil, fmt.Errorf("connection to cloud provider instance metadata (%s) is prohibited (SSRF defense)", host)
 		}
 
 		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)

@@ -148,17 +148,40 @@ func (c *RFC9111CacheEngine) IsRequestCacheable(r *http.Request) (cacheable bool
 	return true, false
 }
 
-// IsResponseCacheable verifies RFC 9111 Section 3 response cacheability rules.
-func (c *RFC9111CacheEngine) IsResponseCacheable(statusCode int, header http.Header) bool {
+// IsResponseCacheable verifies RFC 9111 Section 3 response cacheability rules for a shared edge cache.
+// Responses with Set-Cookie, Vary: *, or private/no-store directives are never cached.
+// Authenticated or cookie-bearing requests are only cached if explicitly allowed by public/s-maxage/must-revalidate directives.
+func (c *RFC9111CacheEngine) IsResponseCacheable(statusCode int, reqHeader, respHeader http.Header) bool {
 	// Only successful read responses or explicit redirects are cacheable at gateway
 	if statusCode != http.StatusOK && statusCode != http.StatusNonAuthoritativeInfo &&
 		statusCode != http.StatusNoContent && statusCode != http.StatusMovedPermanently {
 		return false
 	}
 
-	cc := strings.ToLower(header.Get("Cache-Control"))
+	cc := strings.ToLower(respHeader.Get("Cache-Control"))
 	if strings.Contains(cc, "no-store") || strings.Contains(cc, "private") {
 		return false
+	}
+
+	// Responses with Set-Cookie contain user-specific state and MUST NOT be stored in a shared cache
+	if respHeader.Get("Set-Cookie") != "" {
+		return false
+	}
+
+	// Vary: * indicates the representation cannot be satisfied from cache for any other request
+	if strings.TrimSpace(respHeader.Get("Vary")) == "*" {
+		return false
+	}
+
+	// RFC 9111 Section 3.5: If request contained Authorization or Cookie, shared cache MUST NOT store response
+	// UNLESS Cache-Control explicitly grants shared caching via 'public', 's-maxage', or 'must-revalidate'.
+	if reqHeader != nil && (reqHeader.Get("Authorization") != "" || reqHeader.Get("Cookie") != "") {
+		hasPublic := strings.Contains(cc, "public")
+		hasSMaxAge := strings.Contains(cc, "s-maxage=")
+		hasMustRevalidate := strings.Contains(cc, "must-revalidate")
+		if !hasPublic && !hasSMaxAge && !hasMustRevalidate {
+			return false
+		}
 	}
 
 	return true
@@ -217,9 +240,18 @@ func (c *RFC9111CacheEngine) Lookup(key string) (*CacheEntry, bool) {
 			var l2Entry CacheEntry
 			if err := json.Unmarshal(data, &l2Entry); err == nil {
 				if !now.After(l2Entry.ExpiresAt) {
-					// Populate local L1 cache
+					// Populate local L1 cache with strict eviction and memory accounting
+					entryBytes := int64(len(key) + len(l2Entry.Body) + len(l2Entry.GzipBody) + 256)
 					c.mu.Lock()
-					c.entries[key] = &l2Entry
+					if entryBytes <= c.maxBytes {
+						for len(c.entries) >= c.maxEntries || (c.currentBytes+entryBytes) > c.maxBytes {
+							if !c.evictOldestLocked() {
+								break
+							}
+						}
+						c.currentBytes += entryBytes
+						c.entries[key] = &l2Entry
+					}
 					c.mu.Unlock()
 					return &l2Entry, true
 				}
@@ -276,10 +308,17 @@ func (c *RFC9111CacheEngine) Store(key, path string, statusCode int, header http
 
 	entryBytes := int64(len(key) + len(body) + len(gzipBody) + 256)
 
+	// Reject entries exceeding 4MB single-entry limit or total cache capacity
+	if entryBytes > 4*1024*1024 || entryBytes > c.maxBytes {
+		return nil
+	}
+
 	c.mu.Lock()
-	// Enforce memory limit: evict oldest if exceeding capacity
-	if len(c.entries) >= c.maxEntries || (c.currentBytes+entryBytes) > c.maxBytes {
-		c.evictOldestLocked()
+	// Enforce memory and entry limits: evict in a loop until capacity is available
+	for len(c.entries) >= c.maxEntries || (c.currentBytes+entryBytes) > c.maxBytes {
+		if !c.evictOldestLocked() {
+			break
+		}
 	}
 
 	if existing, found := c.entries[key]; found {
@@ -404,7 +443,7 @@ func (c *RFC9111CacheEngine) Size() int {
 	return len(c.entries)
 }
 
-func (c *RFC9111CacheEngine) evictOldestLocked() {
+func (c *RFC9111CacheEngine) evictOldestLocked() bool {
 	var oldestKey string
 	var oldestTime time.Time
 
@@ -418,8 +457,13 @@ func (c *RFC9111CacheEngine) evictOldestLocked() {
 	if oldestKey != "" {
 		entry := c.entries[oldestKey]
 		c.currentBytes -= int64(len(entry.Key) + len(entry.Body) + len(entry.GzipBody) + 256)
+		if c.currentBytes < 0 {
+			c.currentBytes = 0
+		}
 		delete(c.entries, oldestKey)
+		return true
 	}
+	return false
 }
 
 func (c *RFC9111CacheEngine) reaperWorker() {

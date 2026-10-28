@@ -99,11 +99,22 @@ func NewUpstreamNode(target *url.URL, rule RouteRule) *UpstreamNode {
 		if resp.StatusCode == http.StatusOK && resp.Request != nil &&
 			(resp.Request.Method == http.MethodGet || resp.Request.Method == http.MethodHead) {
 			if resp.Header.Get("ETag") == "" && resp.Body != nil {
-				bodyBytes, err := io.ReadAll(resp.Body)
+				const maxETagBodyBytes = 5 * 1024 * 1024 // 5 MB ceiling for in-memory ETag generation
+				if resp.ContentLength > maxETagBodyBytes {
+					// Stream large payloads directly without buffering in memory
+					return nil
+				}
+				limReader := io.LimitReader(resp.Body, maxETagBodyBytes+1)
+				bodyBytes, err := io.ReadAll(limReader)
 				if err == nil {
 					_ = resp.Body.Close()
-					resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-					resp.Header.Set("ETag", GenerateETag(bodyBytes))
+					if int64(len(bodyBytes)) > maxETagBodyBytes {
+						// Payload exceeded ceiling; stream without generating in-memory ETag
+						resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(bodyBytes), resp.Body))
+					} else {
+						resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+						resp.Header.Set("ETag", GenerateETag(bodyBytes))
+					}
 				}
 			}
 		}

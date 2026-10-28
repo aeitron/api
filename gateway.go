@@ -121,11 +121,12 @@ func NewAPIGateway(jwtSecret string) *APIGateway {
 
 		// Financial Ledger, Invoicing, and Sovereign Billing
 		{PathPrefix: "/v1/billing", UpstreamURL: billingURL, AllowAnonymous: false, Timeout: 15 * time.Second},
-		{PathPrefix: "/v1/commerce", UpstreamURL: commerceURL, AllowAnonymous: true, Timeout: 15 * time.Second},
+		{PathPrefix: "/v1/commerce/orders", UpstreamURL: commerceURL, AllowAnonymous: false, RequiredScopes: []string{"orders:write"}, Timeout: 20 * time.Second},
+		{PathPrefix: "/v1/commerce", UpstreamURL: commerceURL, AllowAnonymous: false, Timeout: 15 * time.Second},
 
 		// Canonical Product Domains (Route directly with URL rewriting to commerce backend)
 		{PathPrefix: "/v1/catalog", UpstreamURL: commerceURL, RewritePrefix: "/v1/commerce/catalog", AllowAnonymous: true, CacheTTL: 60 * time.Second, Timeout: 10 * time.Second},
-		{PathPrefix: "/v1/orders", UpstreamURL: commerceURL, RewritePrefix: "/v1/commerce/orders", AllowAnonymous: false, Timeout: 20 * time.Second},
+		{PathPrefix: "/v1/orders", UpstreamURL: commerceURL, RewritePrefix: "/v1/commerce/orders", AllowAnonymous: false, RequiredScopes: []string{"orders:write"}, Timeout: 20 * time.Second},
 		{PathPrefix: "/v1/domains", UpstreamURL: commerceURL, RewritePrefix: "/v1/commerce/domains", AllowAnonymous: true, CacheTTL: 30 * time.Second, Timeout: 20 * time.Second},
 		{PathPrefix: "/v1/status", UpstreamURL: statusURL, AllowAnonymous: true, CacheTTL: 15 * time.Second, Timeout: 10 * time.Second},
 		{PathPrefix: "/v1/hosting", UpstreamURL: commerceURL, RewritePrefix: "/v1/commerce/hosting", AllowAnonymous: false, Timeout: 30 * time.Second},
@@ -907,10 +908,12 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Header.Del("X-Actor-ID")
 	r.Header.Del("X-Actor-Role")
 
+	// 8. Authentication & Authorization Policy
+	requiresAuth := !rule.AllowAnonymous
+
 	var tenantCtx *TenantContext
 
-	// 8. Authentication & Authorization
-	if !rule.AllowAnonymous {
+	if requiresAuth {
 		authSpan := tc.StartSpan("gateway.auth", "INTERNAL")
 		ctx, err := gw.authenticator.AuthenticateRequest(r)
 		if err != nil {
@@ -957,6 +960,13 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		tc.EndSpan(tenantRlSpan, http.StatusOK, map[string]string{"ratelimit.allowed": "true"})
 	} else {
+		// Optional authentication on anonymous read routes: if caller provided credentials, extract and populate tenant context
+		if r.Header.Get("Authorization") != "" || r.Header.Get("X-API-Key") != "" {
+			if ctx, err := gw.authenticator.AuthenticateRequest(r); err == nil && ctx != nil {
+				tenantCtx = ctx
+				w.Header().Set("Aeitron-Livemode", strconv.FormatBool(ctx.Livemode))
+			}
+		}
 		w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%d", ipRemaining))
 	}
 
@@ -1004,8 +1014,20 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-		rec, isReplay, acqErr := gw.idempotency.AcquireOrReplay(scopeTenant, idempKey, r.Method, r.URL.Path, bodyBytes, 2*time.Second)
+		reqURI := r.URL.Path
+		if r.URL.RawQuery != "" {
+			reqURI = r.URL.Path + "?" + r.URL.RawQuery
+		}
+
+		rec, isReplay, acqErr := gw.idempotency.AcquireOrReplay(scopeTenant, idempKey, r.Method, reqURI, bodyBytes, 2*time.Second)
 		if acqErr != nil {
+			if errors.Is(acqErr, ErrClusterUnavailable) {
+				tc.EndSpan(idempSpan, http.StatusServiceUnavailable, map[string]string{"error": "cluster_unavailable"})
+				gw.metrics.RecordIdempotencyOp("CLUSTER_UNAVAILABLE")
+				gw.metrics.RecordRequest(r.Method, rule.PathPrefix, http.StatusServiceUnavailable, time.Since(start))
+				WriteProblem(w, r, http.StatusServiceUnavailable, "Service Unavailable", "cluster state store unreachable (fail-closed mode)", "CLUSTER_UNAVAILABLE")
+				return
+			}
 			if errors.Is(acqErr, ErrIdempotencyMismatch) {
 				tc.EndSpan(idempSpan, http.StatusConflict, map[string]string{"error": "mismatch"})
 				gw.metrics.RecordIdempotencyOp("CONFLICT")
@@ -1061,7 +1083,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if cacheable && rule.CacheTTL > 0 {
 		isCacheEligible = true
 		cacheScope := "public@" + apiVersion
-		if tenantCtx != nil && !rule.AllowAnonymous {
+		if tenantCtx != nil {
 			cacheScope = tenantCtx.TenantID + "@" + apiVersion
 		}
 
@@ -1171,7 +1193,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// RFC 9111 Cache Population on successful read
 	if isCacheEligible && wrapper.StatusCode == http.StatusOK {
-		if gw.cache.IsResponseCacheable(wrapper.StatusCode, wrapper.Header()) {
+		if gw.cache.IsResponseCacheable(wrapper.StatusCode, r.Header, wrapper.Header()) {
 			ttl := gw.cache.ParseUpstreamTTL(wrapper.Header(), rule.CacheTTL)
 			if ttl > 0 {
 				gw.cache.Store(cacheKey, r.URL.Path, wrapper.StatusCode, wrapper.Header(), wrapper.BodyBuffer.Bytes(), ttl)
@@ -1223,22 +1245,66 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// extractClientIP extracts and validates the client IP address.
+// Forwarding headers (X-Forwarded-For, X-Real-IP) are ONLY trusted if the immediate peer (RemoteAddr)
+// matches a configured trusted proxy in AEITRON_TRUSTED_PROXIES (e.g. "127.0.0.1,10.0.0.0/8,172.16.0.0/12").
+// If the immediate peer is untrusted or no trusted proxies are configured, RemoteAddr is strictly used.
 func extractClientIP(r *http.Request) string {
-	xfwd := r.Header.Get("X-Forwarded-For")
-	if xfwd != "" {
-		parts := strings.Split(xfwd, ",")
-		if len(parts) > 0 {
-			ip := strings.TrimSpace(parts[0])
-			if ip != "" {
-				return ip
+	remoteHost, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		remoteHost = r.RemoteAddr
+	}
+	remoteIP := net.ParseIP(remoteHost)
+
+	trustedProxiesEnv := os.Getenv("AEITRON_TRUSTED_PROXIES")
+	if trustedProxiesEnv != "" && remoteIP != nil {
+		if isPeerTrustedProxy(remoteIP, trustedProxiesEnv) {
+			// Peer is a trusted proxy: parse X-Forwarded-For from right to left (most recent untrusted hop)
+			if xfwd := r.Header.Get("X-Forwarded-For"); xfwd != "" {
+				parts := strings.Split(xfwd, ",")
+				for i := len(parts) - 1; i >= 0; i-- {
+					cand := strings.TrimSpace(parts[i])
+					if candIP := net.ParseIP(cand); candIP != nil {
+						if !isPeerTrustedProxy(candIP, trustedProxiesEnv) {
+							return candIP.String()
+						}
+					}
+				}
+				if firstIP := net.ParseIP(strings.TrimSpace(parts[0])); firstIP != nil {
+					return firstIP.String()
+				}
+			}
+			if xreal := r.Header.Get("X-Real-IP"); xreal != "" {
+				if realIP := net.ParseIP(strings.TrimSpace(xreal)); realIP != nil {
+					return realIP.String()
+				}
 			}
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil && host != "" {
-		return host
+
+	if remoteIP != nil {
+		return remoteIP.String()
 	}
-	return r.RemoteAddr
+	return remoteHost
+}
+
+func isPeerTrustedProxy(ip net.IP, trustedConfig string) bool {
+	for _, entry := range strings.Split(trustedConfig, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if _, ipNet, err := net.ParseCIDR(entry); err == nil && ipNet != nil {
+			if ipNet.Contains(ip) {
+				return true
+			}
+		} else if parsed := net.ParseIP(entry); parsed != nil {
+			if parsed.Equal(ip) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isMutationMethod(m string) bool {

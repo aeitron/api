@@ -296,7 +296,10 @@ func (e *EventStreamEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, te
 				return
 			}
 			flusher.Flush()
-		case ev := <-sub.ch:
+		case ev, ok := <-sub.ch:
+			if !ok {
+				return
+			}
 			if err := e.writeEvent(w, ev); err != nil {
 				return
 			}
@@ -315,7 +318,10 @@ func (e *EventStreamEngine) writeEvent(w http.ResponseWriter, ev InfrastructureE
 	if eventName == "" {
 		eventName = ev.Type
 	}
-	_, err = fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", ev.ID, eventName, string(dataBytes))
+	// Sanitize against CRLF injection in SSE framing
+	evID := strings.ReplaceAll(strings.ReplaceAll(ev.ID, "\r", ""), "\n", "")
+	eventName = strings.ReplaceAll(strings.ReplaceAll(eventName, "\r", ""), "\n", "")
+	_, err = fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", evID, eventName, string(dataBytes))
 	return err
 }
 

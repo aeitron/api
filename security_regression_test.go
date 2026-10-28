@@ -1,6 +1,7 @@
 package apigateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -853,5 +854,120 @@ func TestSecurityRegression_AuditSpooler_CompletenessAndRestartRecovery(t *testi
 	spoolerInvalid.SetDurablePath(filepath.Join(tmpDir, "missing_dir", "deep", "audit.log"))
 	if err := spoolerInvalid.ValidateDurableStorage(); err == nil {
 		t.Fatalf("expected ValidateDurableStorage to fail for unwritable directory in production")
+	}
+}
+
+// TestSecurityRegression_SSRF_AlibabaAndCGNAT verifies that Alibaba metadata and CGNAT ranges are blocked.
+func TestSecurityRegression_SSRF_AlibabaAndCGNAT(t *testing.T) {
+	t.Setenv("AEITRON_ENV", "production")
+
+	// 1. ValidateSafeTargetURL rejects Alibaba Cloud metadata IP 100.100.100.200
+	if err := ValidateSafeTargetURL("http://100.100.100.200/latest/meta-data/"); err == nil {
+		t.Fatalf("CRITICAL SSRF DEFECT: ValidateSafeTargetURL allowed Alibaba metadata IP 100.100.100.200")
+	}
+
+	// 2. ValidateSafeTargetURL rejects RFC 6598 CGNAT address (100.64.0.1)
+	if err := ValidateSafeTargetURL("http://100.64.0.1/admin"); err == nil {
+		t.Fatalf("CRITICAL SSRF DEFECT: ValidateSafeTargetURL allowed RFC 6598 CGNAT address 100.64.0.1")
+	}
+
+	// 3. SafeDialContext blocks Alibaba Cloud metadata and CGNAT addresses
+	dialer := SafeDialContext(false)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	_, err := dialer(ctx, "tcp", "100.100.100.200:80")
+	if err == nil {
+		t.Fatalf("CRITICAL SSRF DEFECT: SafeDialContext allowed connection to Alibaba metadata IP 100.100.100.200")
+	}
+
+	_, err = dialer(ctx, "tcp", "100.64.1.2:80")
+	if err == nil {
+		t.Fatalf("CRITICAL SSRF DEFECT: SafeDialContext allowed connection to CGNAT address 100.64.1.2")
+	}
+}
+
+// TestSecurityRegression_RFC9111_CacheSharedAuthIsolation verifies shared caching rules under RFC 9111 Section 3.5.
+func TestSecurityRegression_RFC9111_CacheSharedAuthIsolation(t *testing.T) {
+	cache := NewRFC9111CacheEngine(100, 10*1024*1024)
+
+	reqAuth, _ := http.NewRequest("GET", "https://api.aeitron.com/v1/orders", nil)
+	reqAuth.Header.Set("Authorization", "Bearer ae_sec_live_key_test")
+
+	respPrivate := http.Header{}
+	respPrivate.Set("Cache-Control", "max-age=300") // missing public / s-maxage / must-revalidate
+
+	// Authenticated request with generic max-age MUST NOT be stored in shared cache
+	if cache.IsResponseCacheable(http.StatusOK, reqAuth.Header, respPrivate) {
+		t.Fatalf("RFC 9111 VIOLATION: response for authenticated request cached without public/s-maxage/must-revalidate")
+	}
+
+	// Authenticated request with public directive is permitted
+	respPublic := http.Header{}
+	respPublic.Set("Cache-Control", "public, max-age=300")
+	if !cache.IsResponseCacheable(http.StatusOK, reqAuth.Header, respPublic) {
+		t.Fatalf("expected response with 'public' directive to be cacheable")
+	}
+
+	// Responses with Set-Cookie MUST NOT be cached
+	respCookie := http.Header{}
+	respCookie.Set("Set-Cookie", "session=xyz; Secure; HttpOnly")
+	if cache.IsResponseCacheable(http.StatusOK, nil, respCookie) {
+		t.Fatalf("RFC 9111 VIOLATION: response with Set-Cookie was marked cacheable")
+	}
+
+	// Responses with Vary: * MUST NOT be cached
+	respVaryAll := http.Header{}
+	respVaryAll.Set("Vary", "*")
+	if cache.IsResponseCacheable(http.StatusOK, nil, respVaryAll) {
+		t.Fatalf("RFC 9111 VIOLATION: response with Vary: * was marked cacheable")
+	}
+}
+
+// TestSecurityRegression_XForwardedFor_UntrustedProxyIgnored verifies client IP resolution ignores spoofed headers from untrusted remotes.
+func TestSecurityRegression_XForwardedFor_UntrustedProxyIgnored(t *testing.T) {
+	t.Setenv("AEITRON_TRUSTED_PROXIES", "10.0.0.1,10.0.0.2")
+
+	// 1. Untrusted remote attempts to spoof X-Forwarded-For
+	req1, _ := http.NewRequest("GET", "/v1/status", nil)
+	req1.RemoteAddr = "203.0.113.50:54321" // untrusted public IP
+	req1.Header.Set("X-Forwarded-For", "198.51.100.1")
+
+	extracted1 := extractClientIP(req1)
+	if extracted1 != "203.0.113.50" {
+		t.Fatalf("expected direct RemoteAddr '203.0.113.50' from untrusted peer, got spoofed '%s'", extracted1)
+	}
+
+	// 2. Trusted proxy forwards genuine client IP
+	req2, _ := http.NewRequest("GET", "/v1/status", nil)
+	req2.RemoteAddr = "10.0.0.1:443" // trusted proxy IP
+	req2.Header.Set("X-Forwarded-For", "198.51.100.1")
+
+	extracted2 := extractClientIP(req2)
+	if extracted2 != "198.51.100.1" {
+		t.Fatalf("expected forwarded client IP '198.51.100.1' from trusted proxy, got '%s'", extracted2)
+	}
+}
+
+// TestSecurityRegression_CacheCapacityLoopEvictionAndSingleEntryCap verifies bounded cache behavior.
+func TestSecurityRegression_CacheCapacityLoopEvictionAndSingleEntryCap(t *testing.T) {
+	cache := NewRFC9111CacheEngine(10, 5000) // 5KB capacity, max 10 entries
+
+	// 1. Reject entries > 4MB
+	oversized := make([]byte, 5*1024*1024)
+	entry := cache.Store("key_big", "/big", http.StatusOK, http.Header{}, oversized, 60*time.Second)
+	if entry != nil {
+		t.Fatalf("expected nil when storing payload exceeding 4MB single-entry cap")
+	}
+
+	// 2. Evict in a loop when total capacity is constrained
+	for i := 0; i < 6; i++ {
+		payload := bytes.Repeat([]byte("a"), 1000)
+		cache.Store(fmt.Sprintf("key_%d", i), fmt.Sprintf("/path_%d", i), http.StatusOK, http.Header{}, payload, 60*time.Second)
+	}
+
+	// Total entries must remain within capacity limits
+	if cache.Size() > 5 {
+		t.Fatalf("expected cache size <= 5 after capacity loop eviction, got %d", cache.Size())
 	}
 }

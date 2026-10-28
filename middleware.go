@@ -272,6 +272,13 @@ func (s *AuditSpooler) Spool(rec AuditRecord) {
 		}
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			if s.durablePath != "" {
+				s.writeDurable(rec)
+			}
+		}
+	}()
 	select {
 	case s.ch <- rec:
 	default:
@@ -335,7 +342,16 @@ func (s *AuditSpooler) writeDurable(rec AuditRecord) {
 		fmt.Fprintf(os.Stderr, "[CRITICAL AUDIT DROP] Failed to write durable audit record to %q: %v\n", s.durablePath, wErr)
 	} else {
 		// Flush OS write buffers to disk to guarantee persistence across crashes
-		_ = f.Sync()
+		if syncErr := f.Sync(); syncErr != nil {
+			s.fileErrorCount.Add(1)
+			s.mu.RLock()
+			fileErrCb := s.onFileError
+			s.mu.RUnlock()
+			if fileErrCb != nil {
+				fileErrCb()
+			}
+			fmt.Fprintf(os.Stderr, "[CRITICAL AUDIT DROP] Failed to sync durable audit file %q: %v\n", s.durablePath, syncErr)
+		}
 	}
 	_ = f.Close()
 }

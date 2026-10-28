@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -14,22 +13,47 @@ var (
 	domainRegex = regexp.MustCompile(`^(?i:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$`)
 
 	privateIPv4Blocks = []*net.IPNet{
-		parseCIDR("10.0.0.0/8"),
-		parseCIDR("172.16.0.0/12"),
-		parseCIDR("192.168.0.0/16"),
-		parseCIDR("127.0.0.0/8"),
-		parseCIDR("169.254.0.0/16"), // Link-local / Cloud metadata (169.254.169.254)
-		parseCIDR("0.0.0.0/8"),
-		parseCIDR("224.0.0.0/4"), // Multicast
-		parseCIDR("240.0.0.0/4"), // Reserved
+		parseCIDR("0.0.0.0/8"),          // RFC 1122 "This host on this network"
+		parseCIDR("10.0.0.0/8"),         // RFC 1918 Private-Use
+		parseCIDR("100.64.0.0/10"),      // RFC 6598 Shared Address Space / CGNAT (includes Alibaba metadata 100.100.100.200)
+		parseCIDR("127.0.0.0/8"),        // RFC 1122 Loopback
+		parseCIDR("169.254.0.0/16"),     // RFC 3927 Link-Local / Cloud Metadata (169.254.169.254, AWS/GCP/Azure/OCI)
+		parseCIDR("172.16.0.0/12"),      // RFC 1918 Private-Use
+		parseCIDR("192.0.0.0/24"),       // RFC 6890 IETF Protocol Assignments
+		parseCIDR("192.0.2.0/24"),       // RFC 5737 Documentation (TEST-NET-1)
+		parseCIDR("192.168.0.0/16"),     // RFC 1918 Private-Use
+		parseCIDR("198.18.0.0/15"),      // RFC 2544 Benchmarking
+		parseCIDR("198.51.100.0/24"),    // RFC 5737 Documentation (TEST-NET-2)
+		parseCIDR("203.0.113.0/24"),     // RFC 5737 Documentation (TEST-NET-3)
+		parseCIDR("224.0.0.0/4"),        // RFC 1112 Multicast
+		parseCIDR("240.0.0.0/4"),        // RFC 1112 Reserved for Future Use
+		parseCIDR("255.255.255.255/32"), // RFC 919 Limited Broadcast
 	}
 
 	privateIPv6Blocks = []*net.IPNet{
-		parseCIDR("::1/128"),
-		parseCIDR("fc00::/7"),  // Unique local address
-		parseCIDR("fe80::/10"), // Link-local
+		parseCIDR("::/128"),        // RFC 4291 Unspecified Address
+		parseCIDR("::1/128"),       // RFC 4291 Loopback
+		parseCIDR("::ffff:0:0/96"), // RFC 4291 IPv4-mapped IPv6
+		parseCIDR("64:ff9b::/96"),  // RFC 6052 IPv4/IPv6 translation
+		parseCIDR("2001:db8::/32"), // RFC 3849 Documentation
+		parseCIDR("fc00::/7"),      // RFC 4193 Unique Local Address (ULA)
+		parseCIDR("fe80::/10"),     // RFC 4291 Link-Local Unicast
+		parseCIDR("ff00::/8"),      // RFC 4291 Multicast
 	}
 )
+
+func isCloudMetadataHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	return h == "169.254.169.254" ||
+		h == "100.100.100.200" ||
+		h == "169.254.169.250" ||
+		h == "metadata.google.internal" ||
+		h == "instance-data" ||
+		h == "metadata.tencentyun.com" ||
+		h == "metadata.aliyun.com" ||
+		strings.HasSuffix(h, ".internal") ||
+		strings.HasSuffix(h, ".local")
+}
 
 func parseCIDR(s string) *net.IPNet {
 	_, block, err := net.ParseCIDR(s)
@@ -63,9 +87,9 @@ func ValidateSafeTargetURL(rawURL string) error {
 		return nil
 	}
 
-	// Reject raw cloud metadata IP outright
-	if hostname == "169.254.169.254" || hostname == "metadata.google.internal" || hostname == "instance-data" {
-		return errors.New("access to cloud provider instance metadata is prohibited")
+	// Reject cloud metadata hostnames and IPs outright
+	if isCloudMetadataHost(hostname) {
+		return fmt.Errorf("access to cloud provider instance metadata (%s) is prohibited", hostname)
 	}
 
 	// Resolve IP addresses
@@ -89,7 +113,7 @@ func ValidateSafeTargetURL(rawURL string) error {
 }
 
 // ValidateSafeUpstreamURL validates an upstream backend target URL before creating a proxy pool.
-// It verifies safe scheme (http/https), valid hostname, and unconditionally blocks cloud metadata endpoints (169.254.169.254, metadata.google.internal).
+// It verifies safe scheme (http/https), valid hostname, and unconditionally blocks cloud metadata endpoints.
 func ValidateSafeUpstreamURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -107,13 +131,12 @@ func ValidateSafeUpstreamURL(rawURL string) error {
 	}
 
 	// Unconditionally reject cloud metadata endpoints in all environments
-	if hostname == "169.254.169.254" || hostname == "metadata.google.internal" || hostname == "instance-data" {
-		return errors.New("upstream URL targeting cloud provider instance metadata is prohibited")
+	if isCloudMetadataHost(hostname) {
+		return fmt.Errorf("upstream URL targeting cloud provider instance metadata (%s) is prohibited", hostname)
 	}
 
 	// In production, validate safe target URL (reject unapproved destination ranges)
-	isProd := strings.EqualFold(os.Getenv("AEITRON_ENV"), "production") || strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "false")
-	if isProd {
+	if IsProductionEnv() {
 		return ValidateSafeTargetURL(rawURL)
 	}
 
@@ -124,7 +147,7 @@ func isPrivateIP(ip net.IP) bool {
 	if ip == nil {
 		return true
 	}
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
 		return true
 	}
 
@@ -134,11 +157,12 @@ func isPrivateIP(ip net.IP) bool {
 				return true
 			}
 		}
-	} else {
-		for _, block := range privateIPv6Blocks {
-			if block.Contains(ip) {
-				return true
-			}
+		return false
+	}
+
+	for _, block := range privateIPv6Blocks {
+		if block.Contains(ip) {
+			return true
 		}
 	}
 

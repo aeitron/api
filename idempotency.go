@@ -116,7 +116,11 @@ func (ie *IdempotencyEngine) AcquireOrReplay(tenantID, key, method, path string,
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		acquired, existing, err := adapter.IdempotencyAcquire(ctx, scopedKey, payloadHash, ie.ttl)
 		cancel()
-		if err == nil {
+		if err != nil {
+			if errors.Is(err, ErrClusterUnavailable) {
+				return nil, false, err
+			}
+		} else {
 			if !acquired && existing != nil {
 				if existing.RequestHash != payloadHash {
 					return nil, false, ErrIdempotencyMismatch
