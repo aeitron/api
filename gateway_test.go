@@ -695,9 +695,10 @@ func TestAPIGateway_IdempotencyKey_Replay(t *testing.T) {
 
 	gw := NewAPIGateway("secret-key-32-bytes-idempotency-suite")
 	_ = gw.RegisterRoute(RouteRule{
-		PathPrefix:     "/v1/orders",
-		UpstreamURL:    upstream.URL,
-		AllowAnonymous: true,
+		PathPrefix:              "/v1/orders",
+		UpstreamURL:             upstream.URL,
+		AllowAnonymous:          true,
+		AllowAnonymousMutations: true,
 	})
 
 	idempKey := "ik_order_deploy_987654321"
@@ -768,9 +769,10 @@ func TestAPIGateway_IdempotencyKey_PayloadMismatchConflict(t *testing.T) {
 
 	gw := NewAPIGateway("secret-key-32-bytes-idempotency-suite")
 	_ = gw.RegisterRoute(RouteRule{
-		PathPrefix:     "/v1/orders",
-		UpstreamURL:    upstream.URL,
-		AllowAnonymous: true,
+		PathPrefix:              "/v1/orders",
+		UpstreamURL:             upstream.URL,
+		AllowAnonymous:          true,
+		AllowAnonymousMutations: true,
 	})
 
 	idempKey := "ik_mismatch_check_88888888"
@@ -810,9 +812,10 @@ func TestAPIGateway_IdempotencyKey_PayloadMismatchConflict(t *testing.T) {
 func TestAPIGateway_IdempotencyKey_InvalidFormat(t *testing.T) {
 	gw := NewAPIGateway("secret-key-32-bytes-idempotency-suite")
 	_ = gw.RegisterRoute(RouteRule{
-		PathPrefix:     "/v1/orders",
-		UpstreamURL:    "http://127.0.0.1:8098",
-		AllowAnonymous: true,
+		PathPrefix:              "/v1/orders",
+		UpstreamURL:             "http://127.0.0.1:8098",
+		AllowAnonymous:          true,
+		AllowAnonymousMutations: true,
 	})
 
 	invalidKeys := []string{
@@ -858,9 +861,10 @@ func TestAPIGateway_IdempotencyKey_ServerErrorDoesNotCache(t *testing.T) {
 
 	gw := NewAPIGateway("secret-key-32-bytes-idempotency-suite")
 	_ = gw.RegisterRoute(RouteRule{
-		PathPrefix:     "/v1/compute",
-		UpstreamURL:    upstream.URL,
-		AllowAnonymous: true,
+		PathPrefix:              "/v1/compute",
+		UpstreamURL:             upstream.URL,
+		AllowAnonymous:          true,
+		AllowAnonymousMutations: true,
 	})
 
 	idempKey := "ik_transient_failure_recovery_123"
@@ -968,10 +972,11 @@ func TestAPIGateway_RFC9111_CacheHitAndMiss(t *testing.T) {
 
 	gw := NewAPIGateway("secret-key-32-bytes-cache-suite")
 	_ = gw.RegisterRoute(RouteRule{
-		PathPrefix:     "/v1/catalog",
-		UpstreamURL:    upstream.URL,
-		AllowAnonymous: true,
-		CacheTTL:       60 * time.Second,
+		PathPrefix:              "/v1/catalog",
+		UpstreamURL:             upstream.URL,
+		AllowAnonymous:          true,
+		AllowAnonymousMutations: true,
+		CacheTTL:                60 * time.Second,
 	})
 
 	// 1. First Request: Cache MISS, calls upstream
@@ -1080,10 +1085,11 @@ func TestAPIGateway_RFC9111_QueryParameterCanonicalization(t *testing.T) {
 
 	gw := NewAPIGateway("secret-key-32-bytes-cache-suite")
 	_ = gw.RegisterRoute(RouteRule{
-		PathPrefix:     "/v1/catalog",
-		UpstreamURL:    upstream.URL,
-		AllowAnonymous: true,
-		CacheTTL:       60 * time.Second,
+		PathPrefix:              "/v1/catalog",
+		UpstreamURL:             upstream.URL,
+		AllowAnonymous:          true,
+		AllowAnonymousMutations: true,
+		CacheTTL:                60 * time.Second,
 	})
 
 	// 1. First order: ?limit=10&region=sgp
@@ -1159,10 +1165,11 @@ func TestAPIGateway_RFC9111_MutationInvalidation(t *testing.T) {
 
 	gw := NewAPIGateway("secret-key-32-bytes-cache-suite")
 	_ = gw.RegisterRoute(RouteRule{
-		PathPrefix:     "/v1/catalog",
-		UpstreamURL:    upstream.URL,
-		AllowAnonymous: true,
-		CacheTTL:       60 * time.Second,
+		PathPrefix:              "/v1/catalog",
+		UpstreamURL:             upstream.URL,
+		AllowAnonymous:          true,
+		AllowAnonymousMutations: true,
+		CacheTTL:                60 * time.Second,
 	})
 
 	// 1. GET request caches resource

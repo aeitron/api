@@ -55,8 +55,14 @@ func main() {
 
 	gw := apigateway.NewAPIGateway(jwtSecret)
 
-	// In production, validate durable audit storage fail-fast before serving traffic
+	// In production, validate routes, cluster state, and durable audit storage fail-fast before serving traffic
 	if isProd {
+		if err := gw.InitError(); err != nil {
+			log.Fatalf("[FATAL] Gateway route initialization failed: %v", err)
+		}
+		if err := gw.ClusterInitError(); err != nil {
+			log.Fatalf("[FATAL] Gateway cluster state initialization failed: %v", err)
+		}
 		if err := gw.AuditSpooler().ValidateDurableStorage(); err != nil {
 			log.Fatalf("[FATAL] Durable audit storage validation failed: %v. In production, durable audit logging is mandatory.", err)
 		}

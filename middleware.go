@@ -37,9 +37,10 @@ func ExtractOrGenerateRequestID(r *http.Request) string {
 // ResponseWriterWrapper intercepts and records the HTTP response status, written byte count, and optional body buffer.
 type ResponseWriterWrapper struct {
 	http.ResponseWriter
-	StatusCode   int
-	BytesWritten int64
-	BodyBuffer   *bytes.Buffer
+	StatusCode      int
+	BytesWritten    int64
+	BodyBuffer      *bytes.Buffer
+	BufferOversized bool
 }
 
 // NewResponseWriterWrapper creates a wrapper defaulting to status 200 OK.
@@ -56,8 +57,14 @@ func (rw *ResponseWriterWrapper) WriteHeader(statusCode int) {
 }
 
 func (rw *ResponseWriterWrapper) Write(b []byte) (int, error) {
-	if rw.BodyBuffer != nil {
-		rw.BodyBuffer.Write(b)
+	if rw.BodyBuffer != nil && !rw.BufferOversized {
+		const maxResponseBufferBytes = 5 * 1024 * 1024 // 5MB in-memory buffer limit
+		if int64(rw.BodyBuffer.Len()+len(b)) > maxResponseBufferBytes {
+			rw.BodyBuffer.Reset()
+			rw.BufferOversized = true
+		} else {
+			rw.BodyBuffer.Write(b)
+		}
 	}
 	n, err := rw.ResponseWriter.Write(b)
 	rw.BytesWritten += int64(n)
@@ -184,10 +191,6 @@ func NewAuditSpooler(bufferSize int) *AuditSpooler {
 		bufferSize = 1000
 	}
 	durablePath := os.Getenv("AEITRON_AUDIT_LOG_FILE")
-	if IsProductionEnv() && durablePath == "" {
-		// In production, enforce standard durable file fallback to prevent audit event loss
-		durablePath = "aeitron_audit.log"
-	}
 	spooler := &AuditSpooler{
 		ch:          make(chan AuditRecord, bufferSize),
 		durablePath: durablePath,

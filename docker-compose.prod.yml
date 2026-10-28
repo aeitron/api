@@ -28,8 +28,15 @@ services:
       - AEITRON_JWT_SECRET=${AEITRON_JWT_SECRET:?AEITRON_JWT_SECRET environment variable is required in production}
       - AEITRON_METRICS_TOKEN=${AEITRON_METRICS_TOKEN:?AEITRON_METRICS_TOKEN environment variable is required in production}
       - AEITRON_AUDIT_LOG_FILE=/var/log/aeitron/audit.log
-      - REDIS_URL=redis://:${REDIS_PASSWORD:-aeitron_cluster_secret}@redis:6379/0
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD environment variable is required in production}@redis:6379/0
       - AEITRON_CLUSTER_FAIL_CLOSED=true
+      - AEITRON_COMMERCE_URL=${AEITRON_COMMERCE_URL:-http://commerce:8098}
+      - AEITRON_BILLING_URL=${AEITRON_BILLING_URL:-http://billing:8097}
+      - AEITRON_DNS_URL=${AEITRON_DNS_URL:-http://dns:8053}
+      - AEITRON_EDGE_URL=${AEITRON_EDGE_URL:-http://config-controller:9091}
+      - AEITRON_ROUTER_URL=${AEITRON_ROUTER_URL:-http://global-router:9090}
+      - AEITRON_STATUS_URL=${AEITRON_STATUS_URL:-http://marketing:3001}
+      - AEITRON_SECURITY_URL=${AEITRON_SECURITY_URL:-http://security:8099}
     volumes:
       - audit-logs:/var/log/aeitron
     networks:
@@ -61,13 +68,13 @@ services:
     restart: unless-stopped
     # CRITICAL PRODUCTION SECURITY: Redis is isolated to internal-redis-net.
     # No ports are published to host or WAN.
-    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-aeitron_cluster_secret}", "--protected-mode", "yes"]
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD environment variable is required in production}", "--protected-mode", "yes"]
     volumes:
       - redis-data:/data
     networks:
       - internal-redis-net
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-aeitron_cluster_secret}", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:?REDIS_PASSWORD environment variable is required in production}", "ping"]
       interval: 5s
       timeout: 3s
       retries: 3

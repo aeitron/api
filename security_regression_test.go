@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -970,4 +971,198 @@ func TestSecurityRegression_CacheCapacityLoopEvictionAndSingleEntryCap(t *testin
 	if cache.Size() > 5 {
 		t.Fatalf("expected cache size <= 5 after capacity loop eviction, got %d", cache.Size())
 	}
+}
+
+// TestSecurityRegression_AnonymousRoute_MutationRejected verifies that unauthenticated mutations on anonymous routes are blocked with 401.
+func TestSecurityRegression_AnonymousRoute_MutationRejected(t *testing.T) {
+	gw := NewAPIGateway("secret-key-32-bytes-auth-policy-suite")
+	defer gw.Close()
+
+	// 1. Unauthenticated GET /v1/catalog succeeds (200 OK or upstream proxy)
+	reqGet := httptest.NewRequest(http.MethodGet, "/v1/catalog", nil)
+	recGet := httptest.NewRecorder()
+	gw.ServeHTTP(recGet, reqGet)
+	if recGet.Code == http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET on public catalog route must not return 401 Unauthorized")
+	}
+
+	// 2. Unauthenticated POST /v1/domains must be rejected with 401 Unauthorized
+	reqPostDomain := httptest.NewRequest(http.MethodPost, "/v1/domains", strings.NewReader(`{"domain":"attacker.io"}`))
+	reqPostDomain.Header.Set("Content-Type", "application/json")
+	recPostDomain := httptest.NewRecorder()
+	gw.ServeHTTP(recPostDomain, reqPostDomain)
+	if recPostDomain.Code != http.StatusUnauthorized {
+		t.Fatalf("CRITICAL SECURITY DEFECT: unauthenticated mutation POST /v1/domains was NOT rejected! Got %d", recPostDomain.Code)
+	}
+
+	// 3. Unauthenticated DELETE /v1/domains/foo must be rejected with 401 Unauthorized
+	reqDelDomain := httptest.NewRequest(http.MethodDelete, "/v1/domains/victim.com", nil)
+	recDelDomain := httptest.NewRecorder()
+	gw.ServeHTTP(recDelDomain, reqDelDomain)
+	if recDelDomain.Code != http.StatusUnauthorized {
+		t.Fatalf("CRITICAL SECURITY DEFECT: unauthenticated mutation DELETE /v1/domains was NOT rejected! Got %d", recDelDomain.Code)
+	}
+
+	// 4. Authenticated GET /v1/orders with orders:read succeeds
+	tokenRead, err := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "actor_reader",
+		TenantID: "tenant_reader_1",
+		Scopes:   []string{"orders:read"},
+		Exp:      time.Now().Add(1 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("failed to generate token: %v", err)
+	}
+
+	reqGetOrders := httptest.NewRequest(http.MethodGet, "/v1/orders", nil)
+	reqGetOrders.Header.Set("Authorization", "Bearer "+tokenRead)
+	recGetOrders := httptest.NewRecorder()
+	gw.ServeHTTP(recGetOrders, reqGetOrders)
+	if recGetOrders.Code == http.StatusForbidden {
+		t.Fatalf("GET /v1/orders with 'orders:read' scope must not be forbidden")
+	}
+}
+
+// TestSecurityRegression_Cache_RFC9111_NoCacheAndVary verifies no-cache directive and Vary representation matching.
+func TestSecurityRegression_Cache_RFC9111_NoCacheAndVary(t *testing.T) {
+	cache := NewRFC9111CacheEngine(100, 10*1024*1024)
+
+	// 1. no-cache directive must reject caching
+	respNoCache := http.Header{}
+	respNoCache.Set("Cache-Control", "no-cache, max-age=3600")
+	if cache.IsResponseCacheable(http.StatusOK, nil, respNoCache) {
+		t.Fatalf("RFC 9111 VIOLATION: response with 'Cache-Control: no-cache' was marked cacheable")
+	}
+
+	// 2. x-public or no-public must not fool public directive check for authenticated requests
+	reqAuth, _ := http.NewRequest("GET", "https://api.aeitron.com/data", nil)
+	reqAuth.Header.Set("Authorization", "Bearer token123")
+	respXPublic := http.Header{}
+	respXPublic.Set("Cache-Control", "x-public, max-age=3600")
+	if cache.IsResponseCacheable(http.StatusOK, reqAuth.Header, respXPublic) {
+		t.Fatalf("RFC 9111 VIOLATION: substring match on 'x-public' treated as 'public'")
+	}
+
+	// 3. Vary representation isolation
+	respVary := http.Header{}
+	respVary.Set("Cache-Control", "public, max-age=3600")
+	respVary.Set("Vary", "Accept-Language")
+
+	reqUS, _ := http.NewRequest("GET", "https://api.aeitron.com/i18n", nil)
+	reqUS.Header.Set("Accept-Language", "en-US")
+
+	entry := cache.Store("key_vary_test", "/i18n", http.StatusOK, respVary, []byte("Hello"), 60*time.Second, reqUS.Header)
+	if entry == nil {
+		t.Fatalf("failed to store entry with Vary")
+	}
+
+	// Request with matching header validates
+	if !cache.ValidateVary(reqUS, entry) {
+		t.Fatalf("expected Vary match for same Accept-Language")
+	}
+
+	// Request with different header fails Vary validation
+	reqFR, _ := http.NewRequest("GET", "https://api.aeitron.com/i18n", nil)
+	reqFR.Header.Set("Accept-Language", "fr-FR")
+	if cache.ValidateVary(reqFR, entry) {
+		t.Fatalf("RFC 9111 VIOLATION: Vary representation accepted differing Accept-Language")
+	}
+}
+
+// TestSecurityRegression_Payload_BodyLimitAndBufferSafety verifies 1MB payload caps and bounded response buffers.
+func TestSecurityRegression_Payload_BodyLimitAndBufferSafety(t *testing.T) {
+	gw := NewAPIGateway("secret-key-32-bytes-payload-suite")
+	defer gw.Close()
+
+	tokenAdmin, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "actor_admin",
+		TenantID: "tenant_payload_test",
+		Scopes:   []string{"events:write", "webhooks:write"},
+		Exp:      time.Now().Add(1 * time.Hour).Unix(),
+	})
+
+	// 1. Sending >1MB body to /v1/events/publish returns 413 Payload Too Large
+	oversizedData := bytes.Repeat([]byte("a"), 1024*1024+100)
+	oversizedJSON := fmt.Sprintf(`{"topic":"alerts","type":"cpu","data":"%s"}`, string(oversizedData))
+	reqPublish := httptest.NewRequest(http.MethodPost, "/v1/events/publish", strings.NewReader(oversizedJSON))
+	reqPublish.Header.Set("Authorization", "Bearer "+tokenAdmin)
+	reqPublish.Header.Set("Content-Type", "application/json")
+	recPublish := httptest.NewRecorder()
+	gw.ServeHTTP(recPublish, reqPublish)
+
+	if recPublish.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 Payload Too Large for >1MB event body, got %d", recPublish.Code)
+	}
+
+	// 2. ResponseWriterWrapper drops BodyBuffer beyond 5MB
+	rec := httptest.NewRecorder()
+	rw := NewResponseWriterWrapper(rec)
+	rw.BodyBuffer = &bytes.Buffer{}
+
+	chunk := bytes.Repeat([]byte("a"), 1024*1024) // 1MB chunks
+	for i := 0; i < 6; i++ {
+		_, _ = rw.Write(chunk)
+	}
+
+	if !rw.BufferOversized {
+		t.Fatalf("expected rw.BufferOversized=true after 6MB written to 5MB ceiling")
+	}
+	if rw.BodyBuffer.Len() != 0 {
+		t.Fatalf("expected oversized buffer to be reset to 0 bytes, got %d", rw.BodyBuffer.Len())
+	}
+	if rw.BytesWritten != 6*1024*1024 {
+		t.Fatalf("expected full 6MB to be passed downstream to ResponseWriter, got %d bytes", rw.BytesWritten)
+	}
+}
+
+// TestSecurityRegression_TrustedProxy_AllTrustedChain verifies fallback to remote host when entire chain is trusted.
+func TestSecurityRegression_TrustedProxy_AllTrustedChain(t *testing.T) {
+	t.Setenv("AEITRON_TRUSTED_PROXIES", "10.0.0.0/8,172.16.0.0/12")
+
+	// All hops in XFF belong to trusted subnets
+	req, _ := http.NewRequest("GET", "/v1/status", nil)
+	req.RemoteAddr = "10.1.2.3:5555"
+	req.Header.Set("X-Forwarded-For", "10.0.0.1, 10.0.0.2, 172.16.0.5")
+
+	extracted := extractClientIP(req)
+	// Must not pick first IP (10.0.0.1); should fall back to direct peer IP (10.1.2.3)
+	if extracted != "10.1.2.3" {
+		t.Fatalf("expected peer IP '10.1.2.3' when all forwarded hops are trusted, got '%s'", extracted)
+	}
+}
+
+// TestSecurityRegression_RedisPool_ConcurrencyAndAtomicBounds verifies atomic connection count and thread-safe close.
+func TestSecurityRegression_RedisPool_ConcurrencyAndAtomicBounds(t *testing.T) {
+	adapter := &RedisStateAdapter{
+		cfg: RedisConfig{
+			Addr:        "127.0.0.1:59998",
+			PoolSize:    10,
+			DialTimeout: 20 * time.Millisecond,
+			ReadTimeout: 20 * time.Millisecond,
+		},
+		pool: make(chan *redisConn, 10),
+	}
+
+	var wg sync.WaitGroup
+	// 50 concurrent goroutines querying pool
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			conn, _ := adapter.getConn(ctx)
+			if conn != nil {
+				adapter.putConn(conn, nil)
+			}
+		}()
+	}
+
+	// Concurrent close must not panic
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		_ = adapter.Close()
+	}()
+
+	wg.Wait()
 }

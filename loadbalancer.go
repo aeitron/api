@@ -107,11 +107,15 @@ func NewUpstreamNode(target *url.URL, rule RouteRule) *UpstreamNode {
 				limReader := io.LimitReader(resp.Body, maxETagBodyBytes+1)
 				bodyBytes, err := io.ReadAll(limReader)
 				if err == nil {
-					_ = resp.Body.Close()
 					if int64(len(bodyBytes)) > maxETagBodyBytes {
-						// Payload exceeded ceiling; stream without generating in-memory ETag
-						resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(bodyBytes), resp.Body))
+						// Payload exceeded ceiling; do not generate ETag. Recombine read bytes with original live stream
+						origBody := resp.Body
+						resp.Body = &combinedReadCloser{
+							Reader: io.MultiReader(bytes.NewReader(bodyBytes), origBody),
+							Closer: origBody,
+						}
 					} else {
+						_ = resp.Body.Close()
 						resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 						resp.Header.Set("ETag", GenerateETag(bodyBytes))
 					}
@@ -440,4 +444,9 @@ func (p *UpstreamPool) Close() {
 			p.ticker.Stop()
 		}
 	})
+}
+
+type combinedReadCloser struct {
+	io.Reader
+	io.Closer
 }

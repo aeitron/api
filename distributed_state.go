@@ -218,6 +218,7 @@ type RedisStateAdapter struct {
 	cfg       RedisConfig
 	fallback  *MemoryStateAdapter
 	pool      chan *redisConn
+	poolMu    sync.RWMutex
 	closed    atomic.Bool
 	connCount atomic.Int32
 	metrics   *MetricsCollector
@@ -336,8 +337,19 @@ func (r *RedisStateAdapter) getConn(ctx context.Context) (*redisConn, error) {
 	default:
 	}
 
-	if r.connCount.Load() < int32(r.cfg.PoolSize) {
-		r.connCount.Add(1)
+	allocated := false
+	for {
+		curr := r.connCount.Load()
+		if curr >= int32(r.cfg.PoolSize) {
+			break
+		}
+		if r.connCount.CompareAndSwap(curr, curr+1) {
+			allocated = true
+			break
+		}
+	}
+
+	if allocated {
 		d := net.Dialer{Timeout: r.cfg.DialTimeout}
 		var raw net.Conn
 		var err error
@@ -407,6 +419,8 @@ func (r *RedisStateAdapter) putConn(conn *redisConn, err error) {
 	if conn == nil {
 		return
 	}
+	r.poolMu.RLock()
+	defer r.poolMu.RUnlock()
 	if err != nil || r.closed.Load() {
 		_ = conn.netConn.Close()
 		r.connCount.Add(-1)
@@ -897,7 +911,9 @@ func (r *RedisStateAdapter) Close() error {
 	if r.closed.Swap(true) {
 		return nil
 	}
+	r.poolMu.Lock()
 	close(r.pool)
+	r.poolMu.Unlock()
 	for conn := range r.pool {
 		_ = conn.netConn.Close()
 	}

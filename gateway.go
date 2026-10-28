@@ -22,23 +22,39 @@ import (
 
 // APIGateway is the centralized, high-performance API Gateway and routing proxy.
 type APIGateway struct {
-	mu            sync.RWMutex
-	routes        []RouteRule
-	proxies       map[string]*UpstreamProxy
-	authenticator *Authenticator
-	limiter       *TokenBucketLimiter
-	idempotency   *IdempotencyEngine
-	cache         *RFC9111CacheEngine
-	stateAdapter  ClusterStateAdapter
-	metrics       *MetricsCollector
-	auditSpooler  *AuditSpooler
-	webhookEngine *WebhookEngine
-	eventEngine   *EventStreamEngine
-	sandboxEngine *SandboxEngine
-	tracingEngine *TracingEngine
-	versioning    *VersioningPolicy
-	stats         GatewayStats
-	startTime     time.Time
+	mu             sync.RWMutex
+	routes         []RouteRule
+	proxies        map[string]*UpstreamProxy
+	authenticator  *Authenticator
+	limiter        *TokenBucketLimiter
+	idempotency    *IdempotencyEngine
+	cache          *RFC9111CacheEngine
+	stateAdapter   ClusterStateAdapter
+	metrics        *MetricsCollector
+	auditSpooler   *AuditSpooler
+	webhookEngine  *WebhookEngine
+	eventEngine    *EventStreamEngine
+	sandboxEngine  *SandboxEngine
+	tracingEngine  *TracingEngine
+	versioning     *VersioningPolicy
+	initError      error
+	clusterInitErr error
+	stats          GatewayStats
+	startTime      time.Time
+}
+
+// InitError returns any fatal error encountered during route initialization.
+func (gw *APIGateway) InitError() error {
+	gw.mu.RLock()
+	defer gw.mu.RUnlock()
+	return gw.initError
+}
+
+// ClusterInitError returns any cluster connectivity or initialization failure.
+func (gw *APIGateway) ClusterInitError() error {
+	gw.mu.RLock()
+	defer gw.mu.RUnlock()
+	return gw.clusterInitErr
 }
 
 // NewAPIGateway initializes an APIGateway with default core services.
@@ -77,6 +93,9 @@ func NewAPIGateway(jwtSecret string) *APIGateway {
 			stateAdapter = NewMemoryStateAdapter()
 			metrics.SetClusterMode("memory")
 			metrics.RecordClusterError()
+			if strings.EqualFold(os.Getenv("AEITRON_CLUSTER_FAIL_CLOSED"), "true") || IsProductionEnv() {
+				gw.clusterInitErr = fmt.Errorf("failed to initialize redis cluster adapter in fail-closed mode: %w", err)
+			}
 		}
 	} else {
 		stateAdapter = NewMemoryStateAdapter()
@@ -121,13 +140,13 @@ func NewAPIGateway(jwtSecret string) *APIGateway {
 
 		// Financial Ledger, Invoicing, and Sovereign Billing
 		{PathPrefix: "/v1/billing", UpstreamURL: billingURL, AllowAnonymous: false, Timeout: 15 * time.Second},
-		{PathPrefix: "/v1/commerce/orders", UpstreamURL: commerceURL, AllowAnonymous: false, RequiredScopes: []string{"orders:write"}, Timeout: 20 * time.Second},
+		{PathPrefix: "/v1/commerce/orders", UpstreamURL: commerceURL, AllowAnonymous: false, ReadScopes: []string{"orders:read"}, WriteScopes: []string{"orders:write"}, Timeout: 20 * time.Second},
 		{PathPrefix: "/v1/commerce", UpstreamURL: commerceURL, AllowAnonymous: false, Timeout: 15 * time.Second},
 
 		// Canonical Product Domains (Route directly with URL rewriting to commerce backend)
-		{PathPrefix: "/v1/catalog", UpstreamURL: commerceURL, RewritePrefix: "/v1/commerce/catalog", AllowAnonymous: true, CacheTTL: 60 * time.Second, Timeout: 10 * time.Second},
-		{PathPrefix: "/v1/orders", UpstreamURL: commerceURL, RewritePrefix: "/v1/commerce/orders", AllowAnonymous: false, RequiredScopes: []string{"orders:write"}, Timeout: 20 * time.Second},
-		{PathPrefix: "/v1/domains", UpstreamURL: commerceURL, RewritePrefix: "/v1/commerce/domains", AllowAnonymous: true, CacheTTL: 30 * time.Second, Timeout: 20 * time.Second},
+		{PathPrefix: "/v1/catalog", UpstreamURL: commerceURL, RewritePrefix: "/v1/commerce/catalog", AllowAnonymous: true, WriteScopes: []string{"catalog:write"}, CacheTTL: 60 * time.Second, Timeout: 10 * time.Second},
+		{PathPrefix: "/v1/orders", UpstreamURL: commerceURL, RewritePrefix: "/v1/commerce/orders", AllowAnonymous: false, ReadScopes: []string{"orders:read"}, WriteScopes: []string{"orders:write"}, Timeout: 20 * time.Second},
+		{PathPrefix: "/v1/domains", UpstreamURL: commerceURL, RewritePrefix: "/v1/commerce/domains", AllowAnonymous: true, WriteScopes: []string{"domains:write"}, CacheTTL: 30 * time.Second, Timeout: 20 * time.Second},
 		{PathPrefix: "/v1/status", UpstreamURL: statusURL, AllowAnonymous: true, CacheTTL: 15 * time.Second, Timeout: 10 * time.Second},
 		{PathPrefix: "/v1/hosting", UpstreamURL: commerceURL, RewritePrefix: "/v1/commerce/hosting", AllowAnonymous: false, Timeout: 30 * time.Second},
 		{PathPrefix: "/v1/compute", UpstreamURL: commerceURL, RewritePrefix: "/v1/commerce/compute", AllowAnonymous: false, Timeout: 30 * time.Second},
@@ -145,7 +164,11 @@ func NewAPIGateway(jwtSecret string) *APIGateway {
 	}
 
 	for _, r := range defaultRoutes {
-		_ = gw.RegisterRoute(r)
+		if err := gw.RegisterRoute(r); err != nil {
+			if IsProductionEnv() {
+				gw.initError = fmt.Errorf("production startup failed: invalid default route %s: %w", r.PathPrefix, err)
+			}
+		}
 	}
 
 	return gw
@@ -584,6 +607,17 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/ready" {
+		if gw.InitError() != nil {
+			WriteProblem(w, r, http.StatusServiceUnavailable, "Service Unavailable", gw.InitError().Error(), "STARTUP_ERROR")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusServiceUnavailable, time.Since(start))
+			return
+		}
+		if gw.ClusterInitError() != nil {
+			WriteProblem(w, r, http.StatusServiceUnavailable, "Service Unavailable", gw.ClusterInitError().Error(), "CLUSTER_INIT_FAILED")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusServiceUnavailable, time.Since(start))
+			return
+		}
+
 		// Deep readiness probe: verify cluster state adapter connectivity
 		gw.mu.RLock()
 		adapter := gw.stateAdapter
@@ -909,7 +943,12 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Header.Del("X-Actor-Role")
 
 	// 8. Authentication & Authorization Policy
+	// If rule allows anonymous access, state mutations (POST, PUT, PATCH, DELETE) strictly require authentication
+	// UNLESS the route explicitly allows anonymous mutations (AllowAnonymousMutations: true) or is a public auth endpoint.
 	requiresAuth := !rule.AllowAnonymous
+	if rule.AllowAnonymous && isMutationMethod(r.Method) && !rule.AllowAnonymousMutations && !strings.HasPrefix(r.URL.Path, "/v1/auth") {
+		requiresAuth = true
+	}
 
 	var tenantCtx *TenantContext
 
@@ -924,8 +963,20 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Resolve method-specific scopes (ReadScopes vs WriteScopes vs RequiredScopes)
+		requiredScopes := rule.RequiredScopes
+		if isMutationMethod(r.Method) {
+			if len(rule.WriteScopes) > 0 {
+				requiredScopes = rule.WriteScopes
+			}
+		} else {
+			if len(rule.ReadScopes) > 0 {
+				requiredScopes = rule.ReadScopes
+			}
+		}
+
 		// Check permission scopes
-		if !CheckScopes(ctx.Scopes, rule.RequiredScopes) {
+		if !CheckScopes(ctx.Scopes, requiredScopes) {
 			tc.EndSpan(authSpan, http.StatusForbidden, map[string]string{"error": "insufficient_scopes"})
 			gw.metrics.RecordRequest(r.Method, rule.PathPrefix, http.StatusForbidden, time.Since(start))
 			WriteForbidden(w, r, "forbidden: insufficient permission scopes")
@@ -1093,7 +1144,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if !bypassLookup {
 			entry, hit := gw.cache.Lookup(cacheKey)
-			if hit && entry != nil {
+			if hit && entry != nil && gw.cache.ValidateVary(r, entry) {
 				// Conditional validation for 304 Not Modified
 				if gw.cache.ValidateConditional(r, entry) {
 					tc.EndSpan(cacheSpan, http.StatusNotModified, map[string]string{"cache.status": "304_NOT_MODIFIED"})
@@ -1191,12 +1242,12 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	duration := time.Since(start)
 
-	// RFC 9111 Cache Population on successful read
-	if isCacheEligible && wrapper.StatusCode == http.StatusOK {
+	// RFC 9111 Cache Population on successful read (skips responses exceeding in-memory buffer limit)
+	if isCacheEligible && wrapper.StatusCode == http.StatusOK && !wrapper.BufferOversized {
 		if gw.cache.IsResponseCacheable(wrapper.StatusCode, r.Header, wrapper.Header()) {
 			ttl := gw.cache.ParseUpstreamTTL(wrapper.Header(), rule.CacheTTL)
 			if ttl > 0 {
-				gw.cache.Store(cacheKey, r.URL.Path, wrapper.StatusCode, wrapper.Header(), wrapper.BodyBuffer.Bytes(), ttl)
+				gw.cache.Store(cacheKey, r.URL.Path, wrapper.StatusCode, wrapper.Header(), wrapper.BodyBuffer.Bytes(), ttl, r.Header)
 				gw.metrics.RecordCacheOp("STORE")
 			}
 		}
@@ -1270,15 +1321,16 @@ func extractClientIP(r *http.Request) string {
 						}
 					}
 				}
-				if firstIP := net.ParseIP(strings.TrimSpace(parts[0])); firstIP != nil {
-					return firstIP.String()
-				}
+				// If all forwarded hops are within trusted proxy ranges, do not blindly return first claimed hop; fall back to real-ip or peer
 			}
 			if xreal := r.Header.Get("X-Real-IP"); xreal != "" {
 				if realIP := net.ParseIP(strings.TrimSpace(xreal)); realIP != nil {
-					return realIP.String()
+					if !isPeerTrustedProxy(realIP, trustedProxiesEnv) {
+						return realIP.String()
+					}
 				}
 			}
+			return remoteIP.String()
 		}
 	}
 
@@ -1324,6 +1376,18 @@ func maskWebhookSecret(s string) string {
 	return "whsec_****************"
 }
 
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst interface{}) error {
+	err := json.NewDecoder(r.Body).Decode(dst)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			WriteProblem(w, r, http.StatusRequestEntityTooLarge, "Payload Too Large", "request payload exceeds maximum limit of 1MB", "PAYLOAD_TOO_LARGE")
+			return err
+		}
+	}
+	return err
+}
+
 func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Request, start time.Time) bool {
 	if !strings.HasPrefix(r.URL.Path, "/v1/webhooks") && !strings.HasPrefix(r.URL.Path, "/webhooks") {
 		return false
@@ -1346,6 +1410,11 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 		return true
 	}
 	tenantID := authCtx.TenantID
+
+	// Bound incoming payload size for all mutation endpoints to 1MB (prevents resource exhaustion)
+	if isMutationMethod(r.Method) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
+	}
 
 	// Enforce tenant-tier token bucket rate limits
 	tierName, tierLimits := ResolveRateLimitTier(authCtx.Tier)
@@ -1397,7 +1466,12 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 			return true
 		}
 		var req CreateSubscriptionRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSON(w, r, &req); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusRequestEntityTooLarge, time.Since(start))
+				return true
+			}
 			WriteBadRequest(w, r, fmt.Sprintf("invalid request payload: %v", err), "INVALID_PAYLOAD")
 			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusBadRequest, time.Since(start))
 			return true
@@ -1408,6 +1482,17 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusBadRequest, time.Since(start))
 			return true
 		}
+		gw.auditSpooler.Spool(AuditRecord{
+			RequestID:  ExtractOrGenerateRequestID(r),
+			TenantID:   tenantID,
+			ActorID:    authCtx.ActorID,
+			Method:     r.Method,
+			Path:       r.URL.Path,
+			ClientIP:   extractClientIP(r),
+			StatusCode: http.StatusCreated,
+			DurationMs: time.Since(start).Milliseconds(),
+			Timestamp:  time.Now().UTC(),
+		})
 		writeJSONResponse(w, http.StatusCreated, map[string]interface{}{
 			"subscription": sub,
 		})
@@ -1433,6 +1518,17 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 			"status": "rotated",
 			"id":     id,
 			"secret": newSecret,
+		})
+		gw.auditSpooler.Spool(AuditRecord{
+			RequestID:  ExtractOrGenerateRequestID(r),
+			TenantID:   tenantID,
+			ActorID:    authCtx.ActorID,
+			Method:     r.Method,
+			Path:       r.URL.Path,
+			ClientIP:   extractClientIP(r),
+			StatusCode: http.StatusOK,
+			DurationMs: time.Since(start).Milliseconds(),
+			Timestamp:  time.Now().UTC(),
 		})
 		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
 		return true
@@ -1500,6 +1596,17 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
 			"status": "deleted",
 			"id":     id,
+		})
+		gw.auditSpooler.Spool(AuditRecord{
+			RequestID:  ExtractOrGenerateRequestID(r),
+			TenantID:   tenantID,
+			ActorID:    authCtx.ActorID,
+			Method:     r.Method,
+			Path:       r.URL.Path,
+			ClientIP:   extractClientIP(r),
+			StatusCode: http.StatusOK,
+			DurationMs: time.Since(start).Milliseconds(),
+			Timestamp:  time.Now().UTC(),
 		})
 		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
 		return true
@@ -1657,6 +1764,11 @@ func (gw *APIGateway) handleEventEndpoints(w http.ResponseWriter, r *http.Reques
 	}
 	tenantID := authCtx.TenantID
 
+	// Bound incoming payload size for all mutation endpoints to 1MB (prevents resource exhaustion)
+	if isMutationMethod(r.Method) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
+	}
+
 	// Enforce tenant-tier token bucket rate limits
 	tierName, tierLimits := ResolveRateLimitTier(authCtx.Tier)
 	allowed, _, retryAfter := gw.limiter.Allow("tenant:"+tenantID+":events", tierLimits.RequestsPerSecond, tierLimits.BurstCapacity)
@@ -1700,7 +1812,12 @@ func (gw *APIGateway) handleEventEndpoints(w http.ResponseWriter, r *http.Reques
 			return true
 		}
 		var evt InfrastructureEvent
-		if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
+		if err := decodeJSON(w, r, &evt); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusRequestEntityTooLarge, time.Since(start))
+				return true
+			}
 			WriteBadRequest(w, r, fmt.Sprintf("invalid event payload: %v", err), "INVALID_PAYLOAD")
 			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusBadRequest, time.Since(start))
 			return true
@@ -1725,6 +1842,17 @@ func (gw *APIGateway) handleEventEndpoints(w http.ResponseWriter, r *http.Reques
 			return true
 		}
 		published := gw.eventEngine.Publish(evt)
+		gw.auditSpooler.Spool(AuditRecord{
+			RequestID:  ExtractOrGenerateRequestID(r),
+			TenantID:   tenantID,
+			ActorID:    authCtx.ActorID,
+			Method:     r.Method,
+			Path:       r.URL.Path,
+			ClientIP:   extractClientIP(r),
+			StatusCode: http.StatusAccepted,
+			DurationMs: time.Since(start).Milliseconds(),
+			Timestamp:  time.Now().UTC(),
+		})
 		writeJSONResponse(w, http.StatusAccepted, map[string]interface{}{
 			"status":    "published",
 			"event_id":  published.ID,

@@ -28,6 +28,7 @@ type CacheEntry struct {
 	TTL          time.Duration     `json:"ttl"`
 	ETag         string            `json:"etag"`
 	LastModified string            `json:"last_modified"`
+	VaryHeaders  map[string]string `json:"vary_headers,omitempty"` // Captured request headers matching origin Vary specification
 }
 
 // AgeSeconds returns the current age of the cached entry in seconds (RFC 9111 Section 4.2.3).
@@ -148,9 +149,28 @@ func (c *RFC9111CacheEngine) IsRequestCacheable(r *http.Request) (cacheable bool
 	return true, false
 }
 
+// parseCacheControlDirectives parses a comma-separated Cache-Control header into exact directive tokens.
+func parseCacheControlDirectives(cc string) map[string]string {
+	dirs := make(map[string]string)
+	for _, part := range strings.Split(cc, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		k, v, found := strings.Cut(part, "=")
+		k = strings.ToLower(strings.TrimSpace(k))
+		if found {
+			dirs[k] = strings.Trim(strings.TrimSpace(v), `"`)
+		} else {
+			dirs[k] = ""
+		}
+	}
+	return dirs
+}
+
 // IsResponseCacheable verifies RFC 9111 Section 3 response cacheability rules for a shared edge cache.
-// Responses with Set-Cookie, Vary: *, or private/no-store directives are never cached.
-// Authenticated or cookie-bearing requests are only cached if explicitly allowed by public/s-maxage/must-revalidate directives.
+// Responses with Set-Cookie, Vary: *, or private/no-store/no-cache directives are never cached.
+// Authenticated or cookie-bearing requests are only cached if explicitly allowed by exact public/s-maxage/must-revalidate directives.
 func (c *RFC9111CacheEngine) IsResponseCacheable(statusCode int, reqHeader, respHeader http.Header) bool {
 	// Only successful read responses or explicit redirects are cacheable at gateway
 	if statusCode != http.StatusOK && statusCode != http.StatusNonAuthoritativeInfo &&
@@ -158,8 +178,16 @@ func (c *RFC9111CacheEngine) IsResponseCacheable(statusCode int, reqHeader, resp
 		return false
 	}
 
-	cc := strings.ToLower(respHeader.Get("Cache-Control"))
-	if strings.Contains(cc, "no-store") || strings.Contains(cc, "private") {
+	dirs := parseCacheControlDirectives(respHeader.Get("Cache-Control"))
+
+	// Disallow caching if no-store, private, or no-cache directive is present
+	if _, ok := dirs["no-store"]; ok {
+		return false
+	}
+	if _, ok := dirs["private"]; ok {
+		return false
+	}
+	if _, ok := dirs["no-cache"]; ok {
 		return false
 	}
 
@@ -174,16 +202,29 @@ func (c *RFC9111CacheEngine) IsResponseCacheable(statusCode int, reqHeader, resp
 	}
 
 	// RFC 9111 Section 3.5: If request contained Authorization or Cookie, shared cache MUST NOT store response
-	// UNLESS Cache-Control explicitly grants shared caching via 'public', 's-maxage', or 'must-revalidate'.
+	// UNLESS Cache-Control explicitly grants shared caching via exact 'public', 's-maxage', or 'must-revalidate' directives.
 	if reqHeader != nil && (reqHeader.Get("Authorization") != "" || reqHeader.Get("Cookie") != "") {
-		hasPublic := strings.Contains(cc, "public")
-		hasSMaxAge := strings.Contains(cc, "s-maxage=")
-		hasMustRevalidate := strings.Contains(cc, "must-revalidate")
+		_, hasPublic := dirs["public"]
+		_, hasSMaxAge := dirs["s-maxage"]
+		_, hasMustRevalidate := dirs["must-revalidate"]
 		if !hasPublic && !hasSMaxAge && !hasMustRevalidate {
 			return false
 		}
 	}
 
+	return true
+}
+
+// ValidateVary checks if a cached representation matches the incoming request headers based on the origin's Vary specification.
+func (c *RFC9111CacheEngine) ValidateVary(r *http.Request, entry *CacheEntry) bool {
+	if entry == nil || len(entry.VaryHeaders) == 0 {
+		return true
+	}
+	for headerName, expectedVal := range entry.VaryHeaders {
+		if r.Header.Get(headerName) != expectedVal {
+			return false
+		}
+	}
 	return true
 }
 
@@ -262,8 +303,8 @@ func (c *RFC9111CacheEngine) Lookup(key string) (*CacheEntry, bool) {
 	return nil, false
 }
 
-// Store caches a response, generating an ETag if not provided, pre-compressing compressible bodies, and recording RFC 1123 Last-Modified.
-func (c *RFC9111CacheEngine) Store(key, path string, statusCode int, header http.Header, body []byte, ttl time.Duration) *CacheEntry {
+// Store caches a response, generating an ETag if not provided, pre-compressing compressible bodies, recording RFC 1123 Last-Modified, and storing Vary variant context.
+func (c *RFC9111CacheEngine) Store(key, path string, statusCode int, header http.Header, body []byte, ttl time.Duration, reqHeaders ...http.Header) *CacheEntry {
 	if ttl <= 0 {
 		return nil
 	}
@@ -291,6 +332,24 @@ func (c *RFC9111CacheEngine) Store(key, path string, statusCode int, header http
 		}
 	}
 
+	var varyHeaders map[string]string
+	if vary := header.Get("Vary"); vary != "" && vary != "*" {
+		varyHeaders = make(map[string]string)
+		var reqHeader http.Header
+		if len(reqHeaders) > 0 {
+			reqHeader = reqHeaders[0]
+		}
+		for _, part := range strings.Split(vary, ",") {
+			part = strings.TrimSpace(part)
+			if part != "" {
+				canon := http.CanonicalHeaderKey(part)
+				if reqHeader != nil {
+					varyHeaders[canon] = reqHeader.Get(canon)
+				}
+			}
+		}
+	}
+
 	entry := &CacheEntry{
 		Key:          key,
 		Path:         path,
@@ -303,6 +362,7 @@ func (c *RFC9111CacheEngine) Store(key, path string, statusCode int, header http
 		TTL:          ttl,
 		ETag:         etag,
 		LastModified: lastMod,
+		VaryHeaders:  varyHeaders,
 	}
 	copy(entry.Body, body)
 

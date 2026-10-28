@@ -280,6 +280,13 @@ func CheckScopes(userScopes []string, required []string) bool {
 
 	for _, req := range required {
 		if !scopeMap[req] {
+			// A write scope implies read permission for the same domain (e.g. orders:write implies orders:read)
+			if strings.HasSuffix(req, ":read") {
+				resource := strings.TrimSuffix(req, ":read")
+				if scopeMap[resource+":write"] || scopeMap[resource+":*"] {
+					continue
+				}
+			}
 			return false
 		}
 	}
