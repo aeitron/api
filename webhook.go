@@ -217,6 +217,53 @@ type WebhookEngine struct {
 	activeSubs atomic.Int64
 }
 
+// SafeDialContext returns a net.DialContext function enforcing connection-time DNS resolution,
+// blocking link-local/cloud metadata IPs, and mitigating SSRF.
+func SafeDialContext(isDev bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+
+		// Reject cloud provider metadata endpoints unconditionally
+		if host == "169.254.169.254" || host == "metadata.google.internal" || host == "instance-data" {
+			return nil, errors.New("connection to cloud provider instance metadata is prohibited (SSRF defense)")
+		}
+
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			ip := net.ParseIP(host)
+			if ip != nil {
+				ips = []net.IPAddr{{IP: ip}}
+			} else {
+				return nil, fmt.Errorf("could not resolve webhook target host %q: %w", host, err)
+			}
+		}
+
+		var safeIP *net.IPAddr
+		for _, ipAddr := range ips {
+			if isPrivateIP(ipAddr.IP) {
+				if isDev && (ipAddr.IP.IsLoopback() || strings.HasPrefix(ipAddr.IP.String(), "127.")) {
+					safeIP = &ipAddr
+					break
+				}
+				return nil, fmt.Errorf("connection to prohibited private/link-local IP %s (%s) blocked (SSRF defense)", ipAddr.IP.String(), host)
+			}
+			if safeIP == nil {
+				safeIP = &ipAddr
+			}
+		}
+
+		if safeIP == nil {
+			return nil, fmt.Errorf("no safe IP address resolved for host %q", host)
+		}
+
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, network, net.JoinHostPort(safeIP.IP.String(), port))
+	}
+}
+
 // NewSafeWebhookClient returns a hardened HTTP client with strict SSRF defenses:
 // 1. Rejects HTTP redirects to prevent open-redirect SSRF targeting internal/metadata services.
 // 2. Enforces connection-time DNS resolution and IP verification to block private, loopback, and cloud metadata IPs.
@@ -227,48 +274,7 @@ func NewSafeWebhookClient(timeout time.Duration) *http.Client {
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-
-			// Reject cloud provider metadata endpoints unconditionally
-			if host == "169.254.169.254" || host == "metadata.google.internal" || host == "instance-data" {
-				return nil, errors.New("connection to cloud provider instance metadata is prohibited (SSRF defense)")
-			}
-
-			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-			if err != nil {
-				ip := net.ParseIP(host)
-				if ip != nil {
-					ips = []net.IPAddr{{IP: ip}}
-				} else {
-					return nil, fmt.Errorf("could not resolve webhook target host %q: %w", host, err)
-				}
-			}
-
-			var safeIP *net.IPAddr
-			for _, ipAddr := range ips {
-				if isPrivateIP(ipAddr.IP) {
-					if isDev && (ipAddr.IP.IsLoopback() || strings.HasPrefix(ipAddr.IP.String(), "127.")) {
-						safeIP = &ipAddr
-						break
-					}
-					return nil, fmt.Errorf("connection to prohibited private/link-local IP %s (%s) blocked (SSRF defense)", ipAddr.IP.String(), host)
-				}
-				if safeIP == nil {
-					safeIP = &ipAddr
-				}
-			}
-
-			if safeIP == nil {
-				return nil, fmt.Errorf("no safe IP address resolved for host %q", host)
-			}
-
-			var dialer net.Dialer
-			return dialer.DialContext(ctx, network, net.JoinHostPort(safeIP.IP.String(), port))
-		},
+		DialContext:         SafeDialContext(isDev),
 	}
 
 	return &http.Client{
@@ -305,12 +311,32 @@ func NewWebhookEngine(cfg WebhookConfig, metrics *MetricsCollector) *WebhookEngi
 		cfg.ClockSkewWindow = 5 * time.Minute
 	}
 
+	isDev := strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "true") || strings.EqualFold(os.Getenv("AEITRON_ENV"), "development")
+	isProd := strings.EqualFold(os.Getenv("AEITRON_ENV"), "production")
+
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		httpClient = NewSafeWebhookClient(cfg.HTTPTimeout)
-	} else if httpClient.CheckRedirect == nil {
+	} else {
+		// Enforce fail-closed SSRF defenses on custom HTTP client:
+		// 1. Unconditionally prohibit redirects (overriding any custom redirect follower)
 		httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			return errors.New("webhook delivery does not follow HTTP redirects (mitigate redirect SSRF)")
+		}
+		// 2. Enforce connection-level SSRF defense on custom transport
+		if tr, ok := httpClient.Transport.(*http.Transport); ok && tr != nil {
+			tr.DialContext = SafeDialContext(isDev)
+		} else if httpClient.Transport == nil {
+			httpClient.Transport = &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 20,
+				IdleConnTimeout:     90 * time.Second,
+				DialContext:         SafeDialContext(isDev),
+			}
+		} else if isProd {
+			// In production, unverified or non-standard custom transports that cannot enforce SafeDialContext
+			// are strictly replaced with the hardened SSRF-safe transport.
+			httpClient.Transport = NewSafeWebhookClient(cfg.HTTPTimeout).Transport
 		}
 	}
 

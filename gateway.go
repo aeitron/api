@@ -64,6 +64,7 @@ func NewAPIGateway(jwtSecret string) *APIGateway {
 		},
 		startTime: start,
 	}
+	gw.auditSpooler.SetOnDrop(metrics.RecordAuditDrop)
 
 	// Pluggable Distributed State: in-memory by default, or auto-connect to Redis / KeyDB when REDIS_URL is configured
 	var stateAdapter ClusterStateAdapter
@@ -396,6 +397,37 @@ func (gw *APIGateway) matchRoute(rawPath string) (*RouteRule, *UpstreamProxy) {
 // In production (AEITRON_ENV=production or AEITRON_DEV_MODE=false), unauthenticated access fails closed with 401 Unauthorized.
 // When credentials are provided in any environment, test/sandbox keys (Livemode == false) are strictly forbidden (403 Forbidden).
 // The caller must possess the "admin" or "operator" role, or explicit "gateway:admin" scope.
+func (gw *APIGateway) authorizeMetricsScrape(r *http.Request) bool {
+	// 1. Dedicated metrics bearer secret token (e.g. Prometheus Kubernetes Secret or Scraper secret)
+	expectedMetricsToken := os.Getenv("AEITRON_METRICS_TOKEN")
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	if expectedMetricsToken != "" {
+		if authHeader == "Bearer "+expectedMetricsToken || r.Header.Get("X-Metrics-Token") == expectedMetricsToken {
+			return true
+		}
+	}
+
+	// 2. Standard Admin/Operator JWT credentials or API Key with metrics:read or gateway:admin scope
+	if authCtx, err := gw.authenticator.AuthenticateRequest(r); err == nil && authCtx != nil {
+		if authCtx.Role == "admin" || authCtx.Role == "operator" {
+			return true
+		}
+		for _, s := range authCtx.Scopes {
+			if s == "metrics:read" || s == "gateway:admin" || s == "*" {
+				return true
+			}
+		}
+	}
+
+	// 3. Loopback scraper permitted if explicitly opted in
+	clientIP := extractClientIP(r)
+	if (clientIP == "127.0.0.1" || clientIP == "::1") && strings.EqualFold(os.Getenv("AEITRON_ALLOW_LOOPBACK_METRICS"), "true") {
+		return true
+	}
+
+	return false
+}
+
 func (gw *APIGateway) authorizeAdminRequest(w http.ResponseWriter, r *http.Request) (*TenantContext, bool) {
 	isProd := strings.EqualFold(os.Getenv("AEITRON_ENV"), "production") || strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "false")
 	authCtx, authErr := gw.authenticator.AuthenticateRequest(r)
@@ -523,6 +555,12 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/metrics" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		isProd := strings.EqualFold(os.Getenv("AEITRON_ENV"), "production") || strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "false")
+		if isProd && !gw.authorizeMetricsScrape(r) {
+			WriteUnauthorized(w, r, "unauthorized: /metrics endpoint requires authenticated scraper credentials in production")
+			gw.metrics.RecordRequest(r.Method, "/metrics", http.StatusUnauthorized, time.Since(start))
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		if r.Method != http.MethodHead {
@@ -897,14 +935,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 
 		// 9. Tenant-Level Rate Limiting
-		tierName := ctx.Tier
-		if tierName == "" {
-			tierName = "free"
-		}
-		tierConfig, exists := DefaultRateLimits[tierName]
-		if !exists {
-			tierConfig = DefaultRateLimits["free"]
-		}
+		tierName, tierConfig := ResolveRateLimitTier(ctx.Tier)
 
 		tenantRlSpan := tc.StartSpan("gateway.ratelimit", "INTERNAL")
 		tenantRlSpan.SetAttribute("ratelimit.key", "tenant:"+ctx.TenantID)
@@ -1247,16 +1278,12 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 	tenantID := authCtx.TenantID
 
 	// Enforce tenant-tier token bucket rate limits
-	tier := authCtx.Tier
-	tierLimits, ok := DefaultRateLimits[tier]
-	if !ok {
-		tierLimits = DefaultRateLimits["tier_free"]
-	}
+	tierName, tierLimits := ResolveRateLimitTier(authCtx.Tier)
 	allowed, _, retryAfter := gw.limiter.Allow("tenant:"+tenantID+":webhooks", tierLimits.RequestsPerSecond, tierLimits.BurstCapacity)
 	if !allowed {
-		gw.metrics.RecordRateLimit(tier)
+		gw.metrics.RecordRateLimit(tierName)
 		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusTooManyRequests, time.Since(start))
-		WriteRateLimited(w, r, "rate limit exceeded for tier "+tier, int(retryAfter.Seconds()))
+		WriteRateLimited(w, r, "rate limit exceeded for tier "+tierName, int(retryAfter.Seconds()))
 		return true
 	}
 
@@ -1561,16 +1588,12 @@ func (gw *APIGateway) handleEventEndpoints(w http.ResponseWriter, r *http.Reques
 	tenantID := authCtx.TenantID
 
 	// Enforce tenant-tier token bucket rate limits
-	tier := authCtx.Tier
-	tierLimits, ok := DefaultRateLimits[tier]
-	if !ok {
-		tierLimits = DefaultRateLimits["tier_free"]
-	}
+	tierName, tierLimits := ResolveRateLimitTier(authCtx.Tier)
 	allowed, _, retryAfter := gw.limiter.Allow("tenant:"+tenantID+":events", tierLimits.RequestsPerSecond, tierLimits.BurstCapacity)
 	if !allowed {
-		gw.metrics.RecordRateLimit(tier)
+		gw.metrics.RecordRateLimit(tierName)
 		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusTooManyRequests, time.Since(start))
-		WriteRateLimited(w, r, "rate limit exceeded for tier "+tier, int(retryAfter.Seconds()))
+		WriteRateLimited(w, r, "rate limit exceeded for tier "+tierName, int(retryAfter.Seconds()))
 		return true
 	}
 

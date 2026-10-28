@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 var validRequestIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,64}$`)
@@ -157,23 +159,43 @@ func HandleCORS(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
-// AuditSpooler buffers and dispatches audit events for state mutations.
+// AuditSpooler buffers and dispatches audit events for state mutations with durable persistence fallback.
 type AuditSpooler struct {
-	mu      sync.RWMutex
-	records []AuditRecord
-	ch      chan AuditRecord
+	mu           sync.RWMutex
+	records      []AuditRecord
+	ch           chan AuditRecord
+	droppedCount atomic.Int64
+	durablePath  string
+	fileMu       sync.Mutex
+	onDrop       func()
 }
 
-// NewAuditSpooler creates a background audit spooler.
+// NewAuditSpooler creates a background audit spooler with optional durable storage.
 func NewAuditSpooler(bufferSize int) *AuditSpooler {
 	if bufferSize <= 0 {
 		bufferSize = 1000
 	}
+	durablePath := os.Getenv("AEITRON_AUDIT_LOG_FILE")
 	spooler := &AuditSpooler{
-		ch: make(chan AuditRecord, bufferSize),
+		ch:          make(chan AuditRecord, bufferSize),
+		durablePath: durablePath,
 	}
 	go spooler.worker()
 	return spooler
+}
+
+// SetOnDrop registers a callback invoked whenever the memory queue experiences backpressure.
+func (s *AuditSpooler) SetOnDrop(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onDrop = fn
+}
+
+// SetDurablePath configures an append-only JSON-lines file path for audit events.
+func (s *AuditSpooler) SetDurablePath(path string) {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	s.durablePath = path
 }
 
 func (s *AuditSpooler) worker() {
@@ -184,16 +206,51 @@ func (s *AuditSpooler) worker() {
 		}
 		s.records = append(s.records, rec)
 		s.mu.Unlock()
+
+		if s.durablePath != "" {
+			s.writeDurable(rec)
+		}
 	}
 }
 
-// Spool queues an audit event asynchronously.
+// Spool queues an audit event asynchronously. Under backpressure, records are written
+// to durable fallback storage rather than silently discarded, and droppedCount is incremented.
 func (s *AuditSpooler) Spool(rec AuditRecord) {
 	select {
 	case s.ch <- rec:
 	default:
-		// Drop without blocking request path under extreme backpressure
+		s.droppedCount.Add(1)
+		s.mu.RLock()
+		cb := s.onDrop
+		s.mu.RUnlock()
+		if cb != nil {
+			cb()
+		}
+		if s.durablePath != "" {
+			s.writeDurable(rec)
+		}
 	}
+}
+
+func (s *AuditSpooler) writeDurable(rec AuditRecord) {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	if s.durablePath == "" {
+		return
+	}
+	b, err := json.Marshal(rec)
+	if err == nil {
+		f, fErr := os.OpenFile(s.durablePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if fErr == nil {
+			_, _ = f.Write(append(b, '\n'))
+			_ = f.Close()
+		}
+	}
+}
+
+// DroppedCount returns the count of memory-buffer dropped/backpressured audit records.
+func (s *AuditSpooler) DroppedCount() int64 {
+	return s.droppedCount.Load()
 }
 
 // GetRecords returns recent audit records.

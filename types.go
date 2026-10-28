@@ -2,6 +2,7 @@ package apigateway
 
 import (
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -60,7 +61,7 @@ type RateLimitTierConfig struct {
 	BurstCapacity     int     `json:"burst_capacity"`
 }
 
-// DefaultRateLimits defines production token-bucket tiers.
+// DefaultRateLimits defines production token-bucket tiers with explicit aliases.
 var DefaultRateLimits = map[string]RateLimitTierConfig{
 	"ip_default": {
 		RequestsPerSecond: 100.0, // 100 req/s per IP
@@ -70,14 +71,60 @@ var DefaultRateLimits = map[string]RateLimitTierConfig{
 		RequestsPerSecond: 1.0, // 60 req/min
 		BurstCapacity:     10,
 	},
+	"tier_free": {
+		RequestsPerSecond: 1.0,
+		BurstCapacity:     10,
+	},
+	"developer": {
+		RequestsPerSecond: 5.0, // 300 req/min
+		BurstCapacity:     25,
+	},
+	"tier_developer": {
+		RequestsPerSecond: 5.0,
+		BurstCapacity:     25,
+	},
 	"pro": {
 		RequestsPerSecond: 10.0, // 600 req/min
+		BurstCapacity:     50,
+	},
+	"tier_pro": {
+		RequestsPerSecond: 10.0,
 		BurstCapacity:     50,
 	},
 	"enterprise": {
 		RequestsPerSecond: 1000.0, // 60,000 req/min
 		BurstCapacity:     2000,
 	},
+	"tier_enterprise": {
+		RequestsPerSecond: 1000.0,
+		BurstCapacity:     2000,
+	},
+}
+
+// ResolveRateLimitTier safely normalizes and resolves any tier string to an approved tier config.
+// Unknown, empty, or unmapped tiers fail closed to the restricted "free" tier (never unlimited).
+func ResolveRateLimitTier(tier string) (string, RateLimitTierConfig) {
+	clean := strings.ToLower(strings.TrimSpace(tier))
+	if clean == "" {
+		return "free", DefaultRateLimits["free"]
+	}
+	if cfg, exists := DefaultRateLimits[clean]; exists {
+		return clean, cfg
+	}
+	// Support un-prefixed or prefixed variants
+	if strings.HasPrefix(clean, "tier_") {
+		unprefixed := strings.TrimPrefix(clean, "tier_")
+		if cfg, exists := DefaultRateLimits[unprefixed]; exists {
+			return unprefixed, cfg
+		}
+	} else {
+		prefixed := "tier_" + clean
+		if cfg, exists := DefaultRateLimits[prefixed]; exists {
+			return clean, cfg
+		}
+	}
+	// Fail-safe default for unknown tiers: always bound to free tier
+	return "free", DefaultRateLimits["free"]
 }
 
 // GatewayStats reports live operational metrics.

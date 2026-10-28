@@ -61,6 +61,9 @@ type MetricsCollector struct {
 	sseActiveConnections atomic.Int64
 	sseEventsPublished   atomic.Uint64
 	sseEventsDelivered   atomic.Uint64
+
+	// Audit Spooler Metrics
+	auditDropped atomic.Uint64
 }
 
 // NewMetricsCollector initializes a Prometheus metrics collector.
@@ -273,6 +276,16 @@ func (m *MetricsCollector) RecordSSEEventPublished() {
 // RecordSSEEventDelivered increments delivered SSE events counter.
 func (m *MetricsCollector) RecordSSEEventDelivered() {
 	m.sseEventsDelivered.Add(1)
+}
+
+// RecordAuditDrop increments the counter of backpressured/dropped audit events.
+func (m *MetricsCollector) RecordAuditDrop() {
+	m.auditDropped.Add(1)
+}
+
+// AuditDroppedCount returns the total count of backpressured/dropped audit events.
+func (m *MetricsCollector) AuditDroppedCount() uint64 {
+	return m.auditDropped.Load()
 }
 
 // SetClusterMode stores the active cluster adapter mode ("memory" or "redis").
@@ -697,6 +710,11 @@ func (m *MetricsCollector) RenderPrometheus(proxies map[string]*UpstreamProxy) s
 	buf.WriteString("\n# HELP aeitron_api_sse_events_delivered_total Total real-time infrastructure events delivered to SSE subscribers\n")
 	buf.WriteString("# TYPE aeitron_api_sse_events_delivered_total counter\n")
 	buf.WriteString(fmt.Sprintf("aeitron_api_sse_events_delivered_total %d\n", m.sseEventsDelivered.Load()))
+
+	// Audit Spooler Telemetry
+	buf.WriteString("\n# HELP aeitron_audit_dropped_total Total number of dropped or backpressured audit events\n")
+	buf.WriteString("# TYPE aeitron_audit_dropped_total counter\n")
+	buf.WriteString(fmt.Sprintf("aeitron_audit_dropped_total %d\n", m.auditDropped.Load()))
 
 	// 11. Runtime & Process Gauges
 	buf.WriteString("\n# HELP aeitron_api_uptime_seconds Seconds elapsed since gateway initialization\n")

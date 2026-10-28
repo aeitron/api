@@ -2,8 +2,10 @@ package apigateway
 
 import (
 	"context"
+	"errors"
 	"hash/fnv"
 	"math"
+	"strings"
 	"sync"
 	"time"
 )
@@ -65,10 +67,12 @@ func (l *TokenBucketLimiter) getShard(key string) *shard {
 
 // Allow evaluates if a request with the given key is permitted under rate and capacity.
 // When a distributed cluster state adapter is configured, it synchronizes atomically
-// with cluster nodes; otherwise (or on failure), it seamlessly evaluates local state.
+// with cluster nodes; in fail-closed mode, cluster errors strictly reject requests.
 func (l *TokenBucketLimiter) Allow(key string, rate float64, capacity int) (bool, int, time.Duration) {
+	// Defensively bound non-positive rate or capacity to restricted defaults (never allow unlimited bypass)
 	if rate <= 0 || capacity <= 0 {
-		return true, capacity, 0
+		rate = 1.0
+		capacity = 10
 	}
 
 	l.mu.RLock()
@@ -82,6 +86,15 @@ func (l *TokenBucketLimiter) Allow(key string, rate float64, capacity int) (bool
 		if err == nil {
 			return allowed, remaining, retryAfter
 		}
+		// Distributed operation failed:
+		// If cluster is configured in Fail-Closed mode, reject immediately rather than falling back to local memory.
+		if errors.Is(err, ErrClusterUnavailable) || strings.Contains(err.Error(), "fail-closed") {
+			return false, 0, 1 * time.Second
+		}
+		if redisAd, ok := adapter.(*RedisStateAdapter); ok && redisAd.cfg.FailClosed {
+			return false, 0, 1 * time.Second
+		}
+		// In fail-open mode, fall back to local in-memory token bucket
 	}
 
 	return l.allowLocal(key, rate, capacity)
@@ -89,7 +102,8 @@ func (l *TokenBucketLimiter) Allow(key string, rate float64, capacity int) (bool
 
 func (l *TokenBucketLimiter) allowLocal(key string, rate float64, capacity int) (bool, int, time.Duration) {
 	if rate <= 0 || capacity <= 0 {
-		return true, capacity, 0
+		rate = 1.0
+		capacity = 10
 	}
 
 	s := l.getShard(key)

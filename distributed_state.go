@@ -561,6 +561,9 @@ func (r *RedisStateAdapter) Set(ctx context.Context, key string, val []byte, ttl
 
 	_, readErr := readRESPReply(conn.reader)
 	r.putConn(conn, readErr)
+	if readErr != nil && r.cfg.FailClosed {
+		return fmt.Errorf("%w: failed to read set reply", ErrClusterUnavailable)
+	}
 
 	if r.metrics != nil {
 		r.metrics.RecordClusterOp("set_success")
@@ -876,6 +879,9 @@ func (r *RedisStateAdapter) IdempotencyComplete(ctx context.Context, key string,
 
 	_, readErr := readRESPReply(conn.reader)
 	r.putConn(conn, readErr)
+	if readErr != nil && r.cfg.FailClosed {
+		return fmt.Errorf("%w: failed to read completed idempotency reply", ErrClusterUnavailable)
+	}
 	return nil
 }
 

@@ -486,3 +486,173 @@ func TestSecurityRegression_WebhookSecretMaskingAndRotation(t *testing.T) {
 		t.Fatalf("expected new unmasked rotated secret distinct from original, got %s", rotateResp.Secret)
 	}
 }
+
+// TestSecurityRegression_RedisFailClosedEndToEndRateLimiting verifies that TokenBucketLimiter.Allow()
+// strictly fails closed when Redis is unavailable under AEITRON_CLUSTER_FAIL_CLOSED=true.
+func TestSecurityRegression_RedisFailClosedEndToEndRateLimiting(t *testing.T) {
+	cfg := RedisConfig{
+		Addr:        "127.0.0.1:59998", // Unreachable port
+		PoolSize:    5,
+		DialTimeout: 20 * time.Millisecond,
+		ReadTimeout: 20 * time.Millisecond,
+		FailClosed:  true,
+	}
+	adapter := &RedisStateAdapter{
+		cfg:      cfg,
+		fallback: NewMemoryStateAdapter(),
+		pool:     make(chan *redisConn, cfg.PoolSize),
+	}
+
+	limiter := NewTokenBucketLimiter()
+	limiter.SetStateAdapter(adapter)
+
+	// In fail-closed mode, when Redis drops, Allow() MUST NOT fall back to local memory and permit traffic
+	allowed, remaining, _ := limiter.Allow("tenant:ratelimit_failclosed_test", 10.0, 20)
+	if allowed {
+		t.Fatalf("CRITICAL: TokenBucketLimiter allowed request in fail-closed mode when redis cluster was unreachable!")
+	}
+	if remaining != 0 {
+		t.Fatalf("expected remaining=0 in fail-closed rate limit drop, got %d", remaining)
+	}
+
+	// Also verify Set and IdempotencyComplete fail closed
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	setErr := adapter.Set(ctx, "k", []byte("val"), time.Minute)
+	if setErr == nil || !strings.Contains(setErr.Error(), ErrClusterUnavailable.Error()) {
+		t.Fatalf("expected ErrClusterUnavailable on Set in fail-closed mode, got %v", setErr)
+	}
+
+	idempCompErr := adapter.IdempotencyComplete(ctx, "k", &IdempotencyRecord{Key: "k"}, time.Minute)
+	if idempCompErr == nil || !strings.Contains(idempCompErr.Error(), ErrClusterUnavailable.Error()) {
+		t.Fatalf("expected ErrClusterUnavailable on IdempotencyComplete in fail-closed mode, got %v", idempCompErr)
+	}
+}
+
+// TestSecurityRegression_UnknownTierRateLimiting verifies that unknown or missing tiers
+// are safely resolved and bounded to the restricted "free" tier rather than bypassing rate limiting.
+func TestSecurityRegression_UnknownTierRateLimiting(t *testing.T) {
+	tierName, tierCfg := ResolveRateLimitTier("unknown_tier_hacker")
+	if tierName != "free" {
+		t.Fatalf("expected unknown tier to resolve to 'free', got %s", tierName)
+	}
+	if tierCfg.BurstCapacity != 10 || tierCfg.RequestsPerSecond != 1.0 {
+		t.Fatalf("expected free tier limits (1 rps, 10 burst), got %+v", tierCfg)
+	}
+
+	tierName2, _ := ResolveRateLimitTier("")
+	if tierName2 != "free" {
+		t.Fatalf("expected empty tier to resolve to 'free', got %s", tierName2)
+	}
+
+	limiter := NewTokenBucketLimiter()
+	// Test non-positive rate or capacity: must be bounded to safe defaults
+	for i := 0; i < 15; i++ {
+		allowed, _, _ := limiter.Allow("unknown_test_key", 0, 0)
+		if i >= 10 && allowed {
+			t.Fatalf("expected requests beyond burst 10 to be rate-limited, but request %d was allowed", i)
+		}
+	}
+}
+
+// TestSecurityRegression_CustomWebhookClientSSRFDefense verifies that passing a custom http.Client
+// still enforces strict no-redirect policy and connection-time SSRF defenses.
+func TestSecurityRegression_CustomWebhookClientSSRFDefense(t *testing.T) {
+	customClient := &http.Client{
+		Timeout: 2 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns: 10,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return nil // Integrator mistakenly tries to permit redirects
+		},
+	}
+
+	cfg := WebhookConfig{
+		HTTPClient:  customClient,
+		HTTPTimeout: 2 * time.Second,
+	}
+	_ = NewWebhookEngine(cfg, nil)
+
+	// Verify that custom client's CheckRedirect was hardened
+	req, _ := http.NewRequest(http.MethodGet, "https://example.com", nil)
+	err := customClient.CheckRedirect(req, []*http.Request{req})
+	if err == nil || !strings.Contains(err.Error(), "does not follow HTTP redirects") {
+		t.Fatalf("expected custom client CheckRedirect to be overridden with SSRF defense error, got %v", err)
+	}
+}
+
+// TestSecurityRegression_ProductionMetricsEndpointAuthentication verifies that /metrics
+// requires authenticated credentials in production mode.
+func TestSecurityRegression_ProductionMetricsEndpointAuthentication(t *testing.T) {
+	t.Setenv("AEITRON_ENV", "production")
+	t.Setenv("AEITRON_METRICS_TOKEN", "super-secret-metrics-token-999")
+
+	gw := NewAPIGateway("test-secret-32-bytes-metrics-guard")
+	defer gw.Close()
+
+	// 1. Unauthenticated request to /metrics in production -> 401 Unauthorized
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for /metrics in production, got %d", rec.Code)
+	}
+
+	// 2. Request with valid AEITRON_METRICS_TOKEN -> 200 OK
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set("Authorization", "Bearer super-secret-metrics-token-999")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /metrics with metrics token, got %d", rec.Code)
+	}
+
+	// 3. Request with valid admin JWT token -> 200 OK
+	adminToken, err := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "operator_alice",
+		TenantID: "system",
+		Role:     "operator",
+		Scopes:   []string{"metrics:read"},
+		Exp:      time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("failed to generate admin token: %v", err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /metrics with operator token, got %d", rec.Code)
+	}
+}
+
+// TestSecurityRegression_AuditSpoolerBackpressureAndDropMetrics verifies that queue backpressure
+// tracks dropped counts and triggers onDrop callback.
+func TestSecurityRegression_AuditSpoolerBackpressureAndDropMetrics(t *testing.T) {
+	spooler := NewAuditSpooler(2)
+	dropCount := 0
+	spooler.SetOnDrop(func() {
+		dropCount++
+	})
+
+	for i := 0; i < 20; i++ {
+		spooler.Spool(AuditRecord{
+			RequestID: "req_test",
+			Method:    "POST",
+			Path:      "/v1/orders",
+		})
+	}
+
+	if spooler.DroppedCount() == 0 {
+		t.Fatalf("expected droppedCount > 0 under extreme queue backpressure")
+	}
+	if dropCount == 0 {
+		t.Fatalf("expected drop callback to be invoked under backpressure")
+	}
+}
