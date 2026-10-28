@@ -24,3 +24,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-node load balancing pools (Round-Robin and Least-Connections) with active health probing.
 - End-to-end socket staging test suite (`e2e_staging_test.go`).
 - Multi-stage non-root Alpine Docker container and Docker Compose orchestration stack.
+

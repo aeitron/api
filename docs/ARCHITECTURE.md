@@ -78,3 +78,4 @@ When running across multi-PoP deployments:
 - Configure `REDIS_URL=redis://127.0.0.1:6379/0`.
 - The gateway uses a zero-dependency RESP client to synchronize token buckets, idempotency locks, and cache entries cluster-wide.
 - If Redis becomes unreachable, the gateway automatically logs a cluster error and falls open to thread-safe local in-memory state without dropping requests.
+
