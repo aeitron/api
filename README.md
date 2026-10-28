@@ -1,6 +1,6 @@
 # Aeitron API
 
-Welcome to the Aeitron API main repository.
+Welcome to the Aeitron official main API repository.
 
 This API is currently in public v1 release and provides programmatic control over Aeitron's global edge network, cloud infrastructure, and workload placement services.
 
