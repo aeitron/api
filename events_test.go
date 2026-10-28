@@ -17,23 +17,24 @@ func TestEvents_SSEConnectionAndHeaders(t *testing.T) {
 	gw := NewAPIGateway("test-jwt-secret-key-for-auth-32b")
 	defer gw.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ts := httptest.NewServer(gw)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/events/stream?topics=compute.instances", nil).WithContext(ctx)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/events/stream?topics=compute.instances", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
 	req.Header.Set("X-Tenant-ID", "tenant-alpha")
 
-	w := httptest.NewRecorder()
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("failed to connect to SSE stream: %v", err)
+	}
+	defer resp.Body.Close()
 
-	// Run handler in background
-	go func() {
-		gw.ServeHTTP(w, req)
-	}()
-
-	// Wait briefly for connection headers to be written
-	time.Sleep(50 * time.Millisecond)
-
-	resp := w.Result()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", resp.StatusCode)
 	}
@@ -49,8 +50,6 @@ func TestEvents_SSEConnectionAndHeaders(t *testing.T) {
 	if buf := resp.Header.Get("X-Accel-Buffering"); buf != "no" {
 		t.Fatalf("expected X-Accel-Buffering no, got %s", buf)
 	}
-
-	cancel()
 }
 
 func TestEvents_RealTimeBroadcast(t *testing.T) {
