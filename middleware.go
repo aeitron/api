@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"regexp"
@@ -161,13 +162,15 @@ func HandleCORS(w http.ResponseWriter, r *http.Request) bool {
 
 // AuditSpooler buffers and dispatches audit events for state mutations with durable persistence fallback.
 type AuditSpooler struct {
-	mu           sync.RWMutex
-	records      []AuditRecord
-	ch           chan AuditRecord
-	droppedCount atomic.Int64
-	durablePath  string
-	fileMu       sync.Mutex
-	onDrop       func()
+	mu             sync.RWMutex
+	records        []AuditRecord
+	ch             chan AuditRecord
+	droppedCount   atomic.Int64
+	fileErrorCount atomic.Int64
+	durablePath    string
+	fileMu         sync.Mutex
+	onDrop         func()
+	onFileError    func()
 }
 
 // NewAuditSpooler creates a background audit spooler with optional durable storage.
@@ -189,6 +192,13 @@ func (s *AuditSpooler) SetOnDrop(fn func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onDrop = fn
+}
+
+// SetOnFileError registers a callback invoked whenever durable audit file writing fails.
+func (s *AuditSpooler) SetOnFileError(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onFileError = fn
 }
 
 // SetDurablePath configures an append-only JSON-lines file path for audit events.
@@ -228,6 +238,14 @@ func (s *AuditSpooler) Spool(rec AuditRecord) {
 		}
 		if s.durablePath != "" {
 			s.writeDurable(rec)
+		} else {
+			// In production or when durablePath is unset, prevent silent loss by outputting to stderr
+			isProd := strings.EqualFold(os.Getenv("AEITRON_ENV"), "production") || strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "false")
+			if isProd {
+				if b, err := json.Marshal(rec); err == nil {
+					fmt.Fprintf(os.Stderr, "[CRITICAL AUDIT DROP] Queue saturated and no AEITRON_AUDIT_LOG_FILE configured: %s\n", string(b))
+				}
+			}
 		}
 	}
 }
@@ -239,18 +257,49 @@ func (s *AuditSpooler) writeDurable(rec AuditRecord) {
 		return
 	}
 	b, err := json.Marshal(rec)
-	if err == nil {
-		f, fErr := os.OpenFile(s.durablePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-		if fErr == nil {
-			_, _ = f.Write(append(b, '\n'))
-			_ = f.Close()
+	if err != nil {
+		s.fileErrorCount.Add(1)
+		s.mu.RLock()
+		fileErrCb := s.onFileError
+		s.mu.RUnlock()
+		if fileErrCb != nil {
+			fileErrCb()
 		}
+		return
 	}
+	f, fErr := os.OpenFile(s.durablePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if fErr != nil {
+		s.fileErrorCount.Add(1)
+		s.mu.RLock()
+		fileErrCb := s.onFileError
+		s.mu.RUnlock()
+		if fileErrCb != nil {
+			fileErrCb()
+		}
+		fmt.Fprintf(os.Stderr, "[CRITICAL AUDIT DROP] Failed to open durable audit file %q: %v | Record: %s\n", s.durablePath, fErr, string(b))
+		return
+	}
+	if _, wErr := f.Write(append(b, '\n')); wErr != nil {
+		s.fileErrorCount.Add(1)
+		s.mu.RLock()
+		fileErrCb := s.onFileError
+		s.mu.RUnlock()
+		if fileErrCb != nil {
+			fileErrCb()
+		}
+		fmt.Fprintf(os.Stderr, "[CRITICAL AUDIT DROP] Failed to write durable audit record to %q: %v\n", s.durablePath, wErr)
+	}
+	_ = f.Close()
 }
 
 // DroppedCount returns the count of memory-buffer dropped/backpressured audit records.
 func (s *AuditSpooler) DroppedCount() int64 {
 	return s.droppedCount.Load()
+}
+
+// FileErrorCount returns the total count of durable audit file write/open errors.
+func (s *AuditSpooler) FileErrorCount() int64 {
+	return s.fileErrorCount.Load()
 }
 
 // GetRecords returns recent audit records.

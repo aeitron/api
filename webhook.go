@@ -275,6 +275,8 @@ func NewSafeWebhookClient(timeout time.Duration) *http.Client {
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
 		DialContext:         SafeDialContext(isDev),
+		Proxy:               nil,
+		DialTLSContext:      nil,
 	}
 
 	return &http.Client{
@@ -312,7 +314,7 @@ func NewWebhookEngine(cfg WebhookConfig, metrics *MetricsCollector) *WebhookEngi
 	}
 
 	isDev := strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "true") || strings.EqualFold(os.Getenv("AEITRON_ENV"), "development")
-	isProd := strings.EqualFold(os.Getenv("AEITRON_ENV"), "production")
+	isProd := strings.EqualFold(os.Getenv("AEITRON_ENV"), "production") || strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "false")
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
@@ -326,12 +328,18 @@ func NewWebhookEngine(cfg WebhookConfig, metrics *MetricsCollector) *WebhookEngi
 		// 2. Enforce connection-level SSRF defense on custom transport
 		if tr, ok := httpClient.Transport.(*http.Transport); ok && tr != nil {
 			tr.DialContext = SafeDialContext(isDev)
+			// Prohibit unvalidated proxy routing that could bypass internal IP restrictions
+			tr.Proxy = nil
+			// Clear custom TLS dialer to guarantee all https:// requests invoke SafeDialContext
+			tr.DialTLSContext = nil
 		} else if httpClient.Transport == nil {
 			httpClient.Transport = &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 20,
 				IdleConnTimeout:     90 * time.Second,
 				DialContext:         SafeDialContext(isDev),
+				Proxy:               nil,
+				DialTLSContext:      nil,
 			}
 		} else if isProd {
 			// In production, unverified or non-standard custom transports that cannot enforce SafeDialContext

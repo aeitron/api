@@ -3,8 +3,13 @@ package apigateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -654,5 +659,113 @@ func TestSecurityRegression_AuditSpoolerBackpressureAndDropMetrics(t *testing.T)
 	}
 	if dropCount == 0 {
 		t.Fatalf("expected drop callback to be invoked under backpressure")
+	}
+}
+
+// TestSecurityRegression_CustomWebhookClient_ProxyAndTLSSSRF verifies that custom HTTP clients
+// supplied to WebhookEngine have their Proxy and DialTLSContext sanitized, and SafeDialContext enforced.
+func TestSecurityRegression_CustomWebhookClient_ProxyAndTLSSSRF(t *testing.T) {
+	t.Setenv("AEITRON_DEV_MODE", "false")
+	t.Setenv("AEITRON_ENV", "production")
+
+	// Custom transport attempting proxy to metadata endpoint and custom TLS dialer
+	proxyURL, _ := url.Parse("http://169.254.169.254:8080")
+	customTransport := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return nil, errors.New("custom TLS dialer should have been cleared")
+		},
+	}
+
+	customClient := &http.Client{
+		Transport: customTransport,
+	}
+
+	cfg := DefaultWebhookConfig()
+	cfg.HTTPClient = customClient
+	metrics := NewMetricsCollector(time.Now())
+
+	engine := NewWebhookEngine(cfg, metrics)
+	defer engine.Close()
+
+	// 1. Verify Proxy is wiped on custom transport
+	if customTransport.Proxy != nil {
+		t.Fatalf("expected customTransport.Proxy to be sanitized to nil, but it was retained")
+	}
+
+	// 2. Verify DialTLSContext is wiped on custom transport
+	if customTransport.DialTLSContext != nil {
+		t.Fatalf("expected customTransport.DialTLSContext to be sanitized to nil, but it was retained")
+	}
+
+	// 3. Verify that requests using engine's client to internal/metadata addresses are blocked by SafeDialContext
+	req, _ := http.NewRequest(http.MethodPost, "http://169.254.169.254/latest/meta-data", strings.NewReader("{}"))
+	_, err := engine.client.Do(req)
+	if err == nil {
+		t.Fatalf("expected request to metadata IP to be blocked by SafeDialContext, but it succeeded")
+	}
+	if !strings.Contains(err.Error(), "prohibited") && !strings.Contains(err.Error(), "blocked") {
+		t.Fatalf("expected SSRF block error, got %v", err)
+	}
+
+	// 4. Verify request to private 10.0.0.1 is blocked in production mode
+	req2, _ := http.NewRequest(http.MethodPost, "http://10.0.0.1:8080/webhook", strings.NewReader("{}"))
+	_, err2 := engine.client.Do(req2)
+	if err2 == nil {
+		t.Fatalf("expected request to private IP 10.0.0.1 to be blocked, but it succeeded")
+	}
+	if !strings.Contains(err2.Error(), "prohibited") && !strings.Contains(err2.Error(), "blocked") {
+		t.Fatalf("expected private IP block error, got %v", err2)
+	}
+}
+
+// TestSecurityRegression_AuditSpooler_DurableFileFallbackAndErrors verifies durable storage fallback,
+// JSON-lines disk output, and tracking of file open/write errors.
+func TestSecurityRegression_AuditSpooler_DurableFileFallbackAndErrors(t *testing.T) {
+	metrics := NewMetricsCollector(time.Now())
+	spooler := NewAuditSpooler(2)
+	spooler.SetOnFileError(metrics.RecordAuditFileError)
+
+	tmpDir := t.TempDir()
+	logFile := filepath.Join(tmpDir, "audit_test.log")
+	spooler.SetDurablePath(logFile)
+
+	// Spool records that will saturate queue (capacity 2) and trigger durable writes
+	for i := 0; i < 10; i++ {
+		spooler.Spool(AuditRecord{
+			RequestID: "req_durable_test",
+			Method:    "POST",
+			Path:      "/v1/payments",
+		})
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify file was written
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("expected durable log file to exist: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatalf("expected durable log file to contain records, but it was empty")
+	}
+
+	// Now configure an invalid/unwritable durable path to trigger file errors
+	spooler.SetDurablePath(filepath.Join(tmpDir, "non_existent_subdir", "sub", "audit.log"))
+	for i := 0; i < 10; i++ {
+		spooler.Spool(AuditRecord{
+			RequestID: "req_error_test",
+			Method:    "DELETE",
+			Path:      "/v1/api-keys/key_123",
+		})
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	if spooler.FileErrorCount() == 0 {
+		t.Fatalf("expected FileErrorCount > 0 when file cannot be opened")
+	}
+	if metrics.AuditFileErrorCount() == 0 {
+		t.Fatalf("expected metrics.AuditFileErrorCount > 0")
 	}
 }

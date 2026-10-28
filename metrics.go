@@ -63,7 +63,8 @@ type MetricsCollector struct {
 	sseEventsDelivered   atomic.Uint64
 
 	// Audit Spooler Metrics
-	auditDropped atomic.Uint64
+	auditDropped    atomic.Uint64
+	auditFileErrors atomic.Uint64
 }
 
 // NewMetricsCollector initializes a Prometheus metrics collector.
@@ -286,6 +287,16 @@ func (m *MetricsCollector) RecordAuditDrop() {
 // AuditDroppedCount returns the total count of backpressured/dropped audit events.
 func (m *MetricsCollector) AuditDroppedCount() uint64 {
 	return m.auditDropped.Load()
+}
+
+// RecordAuditFileError increments the counter of durable audit storage file errors.
+func (m *MetricsCollector) RecordAuditFileError() {
+	m.auditFileErrors.Add(1)
+}
+
+// AuditFileErrorCount returns the total count of durable audit storage file errors.
+func (m *MetricsCollector) AuditFileErrorCount() uint64 {
+	return m.auditFileErrors.Load()
 }
 
 // SetClusterMode stores the active cluster adapter mode ("memory" or "redis").
@@ -715,6 +726,10 @@ func (m *MetricsCollector) RenderPrometheus(proxies map[string]*UpstreamProxy) s
 	buf.WriteString("\n# HELP aeitron_audit_dropped_total Total number of dropped or backpressured audit events\n")
 	buf.WriteString("# TYPE aeitron_audit_dropped_total counter\n")
 	buf.WriteString(fmt.Sprintf("aeitron_audit_dropped_total %d\n", m.auditDropped.Load()))
+
+	buf.WriteString("\n# HELP aeitron_audit_file_errors_total Total number of durable audit storage file errors\n")
+	buf.WriteString("# TYPE aeitron_audit_file_errors_total counter\n")
+	buf.WriteString(fmt.Sprintf("aeitron_audit_file_errors_total %d\n", m.auditFileErrors.Load()))
 
 	// 11. Runtime & Process Gauges
 	buf.WriteString("\n# HELP aeitron_api_uptime_seconds Seconds elapsed since gateway initialization\n")

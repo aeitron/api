@@ -65,6 +65,7 @@ func NewAPIGateway(jwtSecret string) *APIGateway {
 		startTime: start,
 	}
 	gw.auditSpooler.SetOnDrop(metrics.RecordAuditDrop)
+	gw.auditSpooler.SetOnFileError(metrics.RecordAuditFileError)
 
 	// Pluggable Distributed State: in-memory by default, or auto-connect to Redis / KeyDB when REDIS_URL is configured
 	var stateAdapter ClusterStateAdapter
