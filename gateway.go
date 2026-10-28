@@ -394,7 +394,8 @@ func (gw *APIGateway) matchRoute(rawPath string) (*RouteRule, *UpstreamProxy) {
 
 // authorizeAdminRequest validates operator/admin credentials for internal gateway diagnostic endpoints.
 // In production (AEITRON_ENV=production or AEITRON_DEV_MODE=false), unauthenticated access fails closed with 401 Unauthorized.
-// When credentials are provided in any environment, the caller must have the "admin" or "operator" role, or "gateway:admin" scope.
+// When credentials are provided in any environment, test/sandbox keys (Livemode == false) are strictly forbidden (403 Forbidden).
+// The caller must possess the "admin" or "operator" role, or explicit "gateway:admin" scope.
 func (gw *APIGateway) authorizeAdminRequest(w http.ResponseWriter, r *http.Request) (*TenantContext, bool) {
 	isProd := strings.EqualFold(os.Getenv("AEITRON_ENV"), "production") || strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "false")
 	authCtx, authErr := gw.authenticator.AuthenticateRequest(r)
@@ -409,13 +410,28 @@ func (gw *APIGateway) authorizeAdminRequest(w http.ResponseWriter, r *http.Reque
 			TenantID: "system_dev",
 			Role:     "operator",
 			ActorID:  "act_dev_local",
-			Scopes:   []string{"*"},
+			Scopes:   []string{"gateway:admin"},
+			Livemode: true,
 		}, true
 	}
 
-	// Validate role & permissions
-	if authCtx.Role != "admin" && authCtx.Role != "operator" && !CheckScopes(authCtx.Scopes, []string{"gateway:admin"}) {
-		WriteForbidden(w, r, "forbidden: administrative operation requires operator or admin role")
+	// 1. Strict Security Invariant: Test and sandbox keys (Livemode == false) can NEVER access administrative routes!
+	if !authCtx.Livemode {
+		WriteForbidden(w, r, "forbidden: test and sandbox credentials cannot access administrative operations")
+		return nil, false
+	}
+
+	// 2. Validate role & permissions: caller must have operator/admin role, or explicit gateway:admin scope
+	hasAdminRole := authCtx.Role == "admin" || authCtx.Role == "operator"
+	hasAdminScope := false
+	for _, s := range authCtx.Scopes {
+		if s == "gateway:admin" {
+			hasAdminScope = true
+			break
+		}
+	}
+	if !hasAdminRole && !hasAdminScope {
+		WriteForbidden(w, r, "forbidden: administrative operation requires operator or admin role or gateway:admin scope")
 		return nil, false
 	}
 
@@ -735,36 +751,43 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal(bodyBytes, &tokenReq)
 			candidateKey := strings.TrimSpace(tokenReq.APIKey)
 			if candidateKey == "" {
-				candidateKey = strings.TrimSpace(tokenReq.ClientID)
+				WriteBadRequest(w, r, "api_key is required", "MISSING_API_KEY")
+				gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusBadRequest, time.Since(start))
+				return
 			}
-			if candidateKey != "" {
-				tenantCtx, vErr := gw.authenticator.validateAPIKey(candidateKey)
-				if vErr == nil {
-					token, tErr := gw.authenticator.GenerateSignedToken(JWTClaims{
-						Sub:       tenantCtx.ActorID,
-						TenantID:  tenantCtx.TenantID,
-						OrgID:     tenantCtx.OrgID,
-						ProjectID: tenantCtx.ProjectID,
-						Role:      tenantCtx.Role,
-						Scopes:    tenantCtx.Scopes,
-						Tier:      tenantCtx.Tier,
-						Exp:       time.Now().Add(1 * time.Hour).Unix(),
-					})
-					if tErr == nil {
-						writeJSONResponse(w, http.StatusOK, map[string]interface{}{
-							"access_token": token,
-							"token_type":   "Bearer",
-							"expires_in":   3600,
-							"tenant_id":    tenantCtx.TenantID,
-							"tier":         tenantCtx.Tier,
-						})
-						gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
-						return
-					}
-				}
+			tenantCtx, vErr := gw.authenticator.validateAPIKey(candidateKey)
+			if vErr != nil {
+				WriteUnauthorized(w, r, "invalid api_key")
+				gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusUnauthorized, time.Since(start))
+				return
 			}
-			// Reset body for upstream proxying if not handled locally
-			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+			livemodeVal := tenantCtx.Livemode
+			token, tErr := gw.authenticator.GenerateSignedToken(JWTClaims{
+				Sub:       tenantCtx.ActorID,
+				TenantID:  tenantCtx.TenantID,
+				OrgID:     tenantCtx.OrgID,
+				ProjectID: tenantCtx.ProjectID,
+				Role:      tenantCtx.Role,
+				Scopes:    tenantCtx.Scopes,
+				Tier:      tenantCtx.Tier,
+				Livemode:  &livemodeVal,
+				Exp:       time.Now().Add(1 * time.Hour).Unix(),
+			})
+			if tErr != nil {
+				WriteProblem(w, r, http.StatusInternalServerError, "Internal Server Error", "failed to generate token", "TOKEN_GEN_ERROR")
+				gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusInternalServerError, time.Since(start))
+				return
+			}
+			writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+				"access_token": token,
+				"token_type":   "Bearer",
+				"expires_in":   3600,
+				"tenant_id":    tenantCtx.TenantID,
+				"tier":         tenantCtx.Tier,
+				"livemode":     tenantCtx.Livemode,
+			})
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
+			return
 		}
 	}
 
@@ -1172,16 +1195,13 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 		return true
 	}
 
-	resolveTenantID := func() string {
-		if tCtx, err := gw.authenticator.AuthenticateRequest(r); err == nil && tCtx != nil && tCtx.TenantID != "" {
-			return tCtx.TenantID
-		}
-		if h := r.Header.Get("X-Tenant-ID"); h != "" {
-			return h
-		}
-		return "default"
+	authCtx, authErr := gw.authenticator.AuthenticateRequest(r)
+	if authErr != nil || authCtx == nil {
+		WriteUnauthorized(w, r, "unauthorized: authentication required for webhook operations")
+		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusUnauthorized, time.Since(start))
+		return true
 	}
-	tenantID := resolveTenantID()
+	tenantID := authCtx.TenantID
 
 	// 0.5. POST /v1/webhooks/test (Interactive Webhook Simulation Engine)
 	if r.URL.Path == "/v1/webhooks/test" && r.Method == http.MethodPost {
@@ -1280,7 +1300,13 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusBadRequest, time.Since(start))
 			return true
 		}
-		if event.TenantID == "" {
+		if event.TenantID != "" && event.TenantID != tenantID {
+			if authCtx.Role != "admin" && authCtx.Role != "operator" {
+				WriteForbidden(w, r, "forbidden: cross-tenant webhook dispatch is forbidden")
+				gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+				return true
+			}
+		} else {
 			event.TenantID = tenantID
 		}
 		deliveries, err := gw.webhookEngine.Dispatch(event)
@@ -1390,16 +1416,13 @@ func (gw *APIGateway) handleEventEndpoints(w http.ResponseWriter, r *http.Reques
 		return false
 	}
 
-	resolveTenantID := func() string {
-		if tCtx, err := gw.authenticator.AuthenticateRequest(r); err == nil && tCtx != nil && tCtx.TenantID != "" {
-			return tCtx.TenantID
-		}
-		if h := r.Header.Get("X-Tenant-ID"); h != "" {
-			return h
-		}
-		return "default"
+	authCtx, authErr := gw.authenticator.AuthenticateRequest(r)
+	if authErr != nil || authCtx == nil {
+		WriteUnauthorized(w, r, "unauthorized: authentication required for webhook operations")
+		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusUnauthorized, time.Since(start))
+		return true
 	}
-	tenantID := resolveTenantID()
+	tenantID := authCtx.TenantID
 
 	// 1. GET /v1/events/stream or /events/stream (Server-Sent Events Real-Time Streaming)
 	if (r.URL.Path == "/v1/events/stream" || r.URL.Path == "/events/stream") && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
@@ -1426,7 +1449,13 @@ func (gw *APIGateway) handleEventEndpoints(w http.ResponseWriter, r *http.Reques
 			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusBadRequest, time.Since(start))
 			return true
 		}
-		if evt.TenantID == "" {
+		if evt.TenantID != "" && evt.TenantID != tenantID {
+			if authCtx.Role != "admin" && authCtx.Role != "operator" {
+				WriteForbidden(w, r, "forbidden: cross-tenant event publishing is forbidden")
+				gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+				return true
+			}
+		} else {
 			evt.TenantID = tenantID
 		}
 		if strings.TrimSpace(evt.Topic) == "" {

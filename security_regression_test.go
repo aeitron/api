@@ -1,0 +1,274 @@
+package apigateway
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestSecurityRegression_TestAPIKeyPrivilegeEscalation verifies that test keys
+// cannot escalate privileges or access administrative operations.
+func TestSecurityRegression_TestAPIKeyPrivilegeEscalation(t *testing.T) {
+	gw := NewAPIGateway("test-secret-32-bytes-security-reg")
+	defer gw.Close()
+
+	// 1. Unregistered test key receives bounded non-admin scopes, NEVER wildcard "*"
+	testKey := "aeitron_test_developer_hacker_key_999"
+	authCtx, err := gw.Authenticator().validateAPIKey(testKey)
+	if err != nil {
+		t.Fatalf("expected sandbox developer key to resolve context: %v", err)
+	}
+
+	if authCtx.Role != "developer" {
+		t.Fatalf("expected role 'developer', got '%s'", authCtx.Role)
+	}
+	if authCtx.Livemode {
+		t.Fatalf("expected livemode to be false for test key, got true")
+	}
+	for _, s := range authCtx.Scopes {
+		if s == "*" {
+			t.Fatalf("CRITICAL SECURITY DEFECT: test key auto-provisioned with wildcard scope '*'!")
+		}
+		if s == "gateway:admin" {
+			t.Fatalf("CRITICAL SECURITY DEFECT: test key assigned administrative scope 'gateway:admin'!")
+		}
+	}
+
+	// 2. Test key attempting administrative endpoint (/v1/gateway/stats) must be rejected with 403 Forbidden
+	req := httptest.NewRequest(http.MethodGet, "/v1/gateway/stats", nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when test key accesses admin endpoint, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	// 3. Test key attempting /v1/gateway/upstreams must be rejected with 403 Forbidden
+	req = httptest.NewRequest(http.MethodGet, "/v1/gateway/upstreams", nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when test key accesses /v1/gateway/upstreams, got %d", rec.Code)
+	}
+
+	// 4. Test key attempting /v1/gateway/traces must be rejected with 403 Forbidden
+	req = httptest.NewRequest(http.MethodGet, "/v1/gateway/traces", nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when test key accesses /v1/gateway/traces, got %d", rec.Code)
+	}
+
+	// 5. /v1/auth/token rejecting client_id fallback without api_key
+	badTokenReq := `{"client_id":"aeitron_test_some_random_id"}`
+	req = httptest.NewRequest(http.MethodPost, "/v1/auth/token", strings.NewReader(badTokenReq))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request when api_key is missing in /v1/auth/token, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	// 6. /v1/auth/token exchanging test key returns a token with livemode: false
+	validTestTokenReq := `{"api_key":"` + testKey + `"}`
+	req = httptest.NewRequest(http.MethodPost, "/v1/auth/token", strings.NewReader(validTestTokenReq))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for test token exchange, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		Livemode    *bool  `json:"livemode"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &tokenResp); err != nil {
+		t.Fatalf("failed to parse token response: %v", err)
+	}
+	if tokenResp.Livemode == nil || *tokenResp.Livemode != false {
+		t.Fatalf("expected token livemode to be explicitly false")
+	}
+
+	// 7. Token derived from test key still CANNOT access administrative endpoints
+	req = httptest.NewRequest(http.MethodGet, "/v1/gateway/stats", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when token derived from test key accesses admin endpoint, got %d", rec.Code)
+	}
+}
+
+// TestSecurityRegression_TenantIdentitySpoofing verifies strict tenant isolation
+// and prevention of unauthenticated header spoofing in events and webhooks.
+func TestSecurityRegression_TenantIdentitySpoofing(t *testing.T) {
+	gw := NewAPIGateway("test-secret-32-bytes-tenant-spoof")
+	defer gw.Close()
+
+	// 1. Unauthenticated access to /v1/events/stream must return 401 Unauthorized
+	req := httptest.NewRequest(http.MethodGet, "/v1/events/stream", nil)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for unauthenticated /v1/events/stream, got %d", rec.Code)
+	}
+
+	// 2. Spoofed X-Tenant-ID header without token must still return 401 Unauthorized
+	req = httptest.NewRequest(http.MethodGet, "/v1/events/stream", nil)
+	req.Header.Set("X-Tenant-ID", "tenant_victim")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("CRITICAL SECURITY DEFECT: unauthenticated X-Tenant-ID header accepted on /v1/events/stream! Got %d", rec.Code)
+	}
+
+	// 3. Unauthenticated access to /v1/webhooks/subscriptions must return 401 Unauthorized
+	req = httptest.NewRequest(http.MethodGet, "/v1/webhooks/subscriptions", nil)
+	req.Header.Set("X-Tenant-ID", "tenant_victim")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("CRITICAL SECURITY DEFECT: unauthenticated X-Tenant-ID header accepted on /v1/webhooks/subscriptions! Got %d", rec.Code)
+	}
+
+	// 4. Authenticate as tenant_attacker
+	attackerTok, err := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "act_attacker",
+		TenantID: "tenant_attacker",
+		Role:     "developer",
+		Scopes:   []string{"events:write", "webhooks:write"},
+		Exp:      time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("failed to generate token: %v", err)
+	}
+	attackerAuth := "Bearer " + attackerTok
+
+	// 5. Attacker attempts to publish event spoofing tenant_victim in request body -> 403 Forbidden
+	spoofedEventJSON := `{
+		"topic": "billing.invoices",
+		"type": "invoice.paid",
+		"tenant_id": "tenant_victim",
+		"data": {"amount": 500000}
+	}`
+	req = httptest.NewRequest(http.MethodPost, "/v1/events/publish", strings.NewReader(spoofedEventJSON))
+	req.Header.Set("Authorization", attackerAuth)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("CRITICAL SECURITY DEFECT: tenant_attacker successfully published event as tenant_victim! Got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	// 6. Attacker attempts to dispatch webhook spoofing tenant_victim in request body -> 403 Forbidden
+	spoofedWebhookJSON := `{
+		"type": "deployment.failed",
+		"tenant_id": "tenant_victim",
+		"data": {"pod": "auth-core-0"}
+	}`
+	req = httptest.NewRequest(http.MethodPost, "/v1/webhooks/dispatch", strings.NewReader(spoofedWebhookJSON))
+	req.Header.Set("Authorization", attackerAuth)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("CRITICAL SECURITY DEFECT: tenant_attacker successfully dispatched webhook as tenant_victim! Got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	// 7. Legitimate publish matching authenticated tenant succeeds (202 Accepted)
+	legitEventJSON := `{
+		"topic": "billing.invoices",
+		"type": "invoice.paid",
+		"tenant_id": "tenant_attacker",
+		"data": {"amount": 100}
+	}`
+	req = httptest.NewRequest(http.MethodPost, "/v1/events/publish", strings.NewReader(legitEventJSON))
+	req.Header.Set("Authorization", attackerAuth)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted for legitimate tenant publish, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSecurityRegression_RedisTLSAndFailClosed verifies rediss:// parsing and fail-closed semantics.
+func TestSecurityRegression_RedisTLSAndFailClosed(t *testing.T) {
+	// 1. parseRedisURL correctly identifies rediss:// scheme and assigns TLS
+	addr, password, db, useTLS, err := parseRedisURL("rediss://:mysecretpassword@redis.cluster.aeitron.internal:6380/3")
+	if err != nil {
+		t.Fatalf("failed to parse rediss URL: %v", err)
+	}
+	if !useTLS {
+		t.Fatalf("expected useTLS=true for rediss:// URL")
+	}
+	if addr != "redis.cluster.aeitron.internal:6380" {
+		t.Fatalf("expected addr 'redis.cluster.aeitron.internal:6380', got '%s'", addr)
+	}
+	if password != "mysecretpassword" {
+		t.Fatalf("expected password 'mysecretpassword', got '%s'", password)
+	}
+	if db != 3 {
+		t.Fatalf("expected db=3, got %d", db)
+	}
+
+	// 2. Verify fail-closed mode when Redis is unreachable and FailClosed is configured
+	cfg := RedisConfig{
+		Addr:        "127.0.0.1:59999", // Unreachable port
+		PoolSize:    5,
+		DialTimeout: 20 * time.Millisecond,
+		ReadTimeout: 20 * time.Millisecond,
+		FailClosed:  true,
+	}
+
+	adapter := &RedisStateAdapter{
+		cfg:      cfg,
+		fallback: NewMemoryStateAdapter(),
+		pool:     make(chan *redisConn, cfg.PoolSize),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// In fail-closed mode, Get must return ErrClusterUnavailable instead of falling back to memory
+	_, getErr := adapter.Get(ctx, "test_cache_key")
+	if getErr == nil || !strings.Contains(getErr.Error(), ErrClusterUnavailable.Error()) {
+		t.Fatalf("expected ErrClusterUnavailable in fail-closed mode, got %v", getErr)
+	}
+
+	// In fail-closed mode, RateLimitAllow must fail closed (allowed=false and error)
+	allowed, _, _, rlErr := adapter.RateLimitAllow(ctx, "test_rate_key", 10.0, 20)
+	if allowed {
+		t.Fatalf("expected allowed=false in fail-closed mode when redis drops")
+	}
+	if rlErr == nil || !strings.Contains(rlErr.Error(), ErrClusterUnavailable.Error()) {
+		t.Fatalf("expected ErrClusterUnavailable on rate limit in fail-closed mode, got %v", rlErr)
+	}
+
+	// In fail-closed mode, IdempotencyAcquire must fail closed
+	acquired, _, idempErr := adapter.IdempotencyAcquire(ctx, "idemp_test_key", "hash123", time.Minute)
+	if acquired {
+		t.Fatalf("expected acquired=false in fail-closed mode when redis drops")
+	}
+	if idempErr == nil || !strings.Contains(idempErr.Error(), ErrClusterUnavailable.Error()) {
+		t.Fatalf("expected ErrClusterUnavailable on idempotency in fail-closed mode, got %v", idempErr)
+	}
+}

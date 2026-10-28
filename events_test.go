@@ -13,6 +13,17 @@ import (
 	"time"
 )
 
+func eventTestToken(gw *APIGateway, tenantID string) string {
+	tok, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "act_" + tenantID,
+		TenantID: tenantID,
+		Role:     "developer",
+		Scopes:   []string{"events:read", "events:write", "webhooks:read", "webhooks:write"},
+		Exp:      time.Now().Add(1 * time.Hour).Unix(),
+	})
+	return tok
+}
+
 func TestEvents_SSEConnectionAndHeaders(t *testing.T) {
 	gw := NewAPIGateway("test-jwt-secret-key-for-auth-32b")
 	defer gw.Close()
@@ -27,7 +38,7 @@ func TestEvents_SSEConnectionAndHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
 	}
-	req.Header.Set("X-Tenant-ID", "tenant-alpha")
+	req.Header.Set("Authorization", "Bearer "+eventTestToken(gw, "tenant-alpha"))
 
 	resp, err := ts.Client().Do(req)
 	if err != nil {
@@ -67,7 +78,7 @@ func TestEvents_RealTimeBroadcast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
 	}
-	req.Header.Set("X-Tenant-ID", "tenant-test")
+	req.Header.Set("Authorization", "Bearer "+eventTestToken(gw, "tenant-test"))
 
 	resp, err := ts.Client().Do(req)
 	if err != nil {
@@ -97,7 +108,7 @@ func TestEvents_RealTimeBroadcast(t *testing.T) {
 		body, _ := json.Marshal(pubPayload)
 		pReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/events/publish", bytes.NewReader(body))
 		pReq.Header.Set("Content-Type", "application/json")
-		pReq.Header.Set("X-Tenant-ID", "tenant-test")
+		pReq.Header.Set("Authorization", "Bearer "+eventTestToken(gw, "tenant-test"))
 		pResp, pErr := ts.Client().Do(pReq)
 		if pErr == nil {
 			pResp.Body.Close()
@@ -232,7 +243,7 @@ func TestEvents_LastEventIDCatchUpReplay(t *testing.T) {
 	// Client requests stream starting after evt_historical_01
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/events/stream?topics=compute.instances", nil)
 	req.Header.Set("Last-Event-ID", "evt_historical_01")
-	req.Header.Set("X-Tenant-ID", "tenant-catchup")
+	req.Header.Set("Authorization", "Bearer "+eventTestToken(gw, "tenant-catchup"))
 
 	resp, err := ts.Client().Do(req)
 	if err != nil {
@@ -281,7 +292,7 @@ func TestEvents_KeepalivePingHeartbeat(t *testing.T) {
 	defer cancel()
 
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/events/stream", nil)
-	req.Header.Set("X-Tenant-ID", "tenant-ping")
+	req.Header.Set("Authorization", "Bearer "+eventTestToken(gw, "tenant-ping"))
 
 	resp, err := ts.Client().Do(req)
 	if err != nil {
@@ -329,7 +340,7 @@ func TestEvents_RecentHistoryEndpoint(t *testing.T) {
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/events/history?topic=dns.health&limit=10", nil)
-	req.Header.Set("X-Tenant-ID", "tenant-history")
+	req.Header.Set("Authorization", "Bearer "+eventTestToken(gw, "tenant-history"))
 	w := httptest.NewRecorder()
 
 	gw.ServeHTTP(w, req)
@@ -385,6 +396,7 @@ func TestWebhook_TestSimulationEndpoint(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks/test", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+eventTestToken(gw, "tenant-test"))
 	w := httptest.NewRecorder()
 
 	gw.ServeHTTP(w, req)
@@ -476,7 +488,7 @@ func TestEvents_WebhookDispatchToSSEConvergence(t *testing.T) {
 	sBody, _ := json.Marshal(subReq)
 	cReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/webhooks/subscriptions", bytes.NewReader(sBody))
 	cReq.Header.Set("Content-Type", "application/json")
-	cReq.Header.Set("X-Tenant-ID", "tenant-convergence")
+	cReq.Header.Set("Authorization", "Bearer "+eventTestToken(gw, "tenant-convergence"))
 	cResp, err := ts.Client().Do(cReq)
 	if err != nil {
 		t.Fatalf("failed to create subscription: %v", err)
@@ -488,7 +500,7 @@ func TestEvents_WebhookDispatchToSSEConvergence(t *testing.T) {
 	defer cancel()
 
 	sseReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/events/stream?topics=webhooks.*", nil)
-	sseReq.Header.Set("X-Tenant-ID", "tenant-convergence")
+	sseReq.Header.Set("Authorization", "Bearer "+eventTestToken(gw, "tenant-convergence"))
 
 	sseResp, err := ts.Client().Do(sseReq)
 	if err != nil {
@@ -513,7 +525,7 @@ func TestEvents_WebhookDispatchToSSEConvergence(t *testing.T) {
 		dBody, _ := json.Marshal(dispReq)
 		pReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/webhooks/dispatch", bytes.NewReader(dBody))
 		pReq.Header.Set("Content-Type", "application/json")
-		pReq.Header.Set("X-Tenant-ID", "tenant-convergence")
+		pReq.Header.Set("Authorization", "Bearer "+eventTestToken(gw, "tenant-convergence"))
 		pResp, pErr := ts.Client().Do(pReq)
 		if pErr == nil {
 			pResp.Body.Close()

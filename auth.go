@@ -14,6 +14,25 @@ import (
 	"time"
 )
 
+// SandboxDeveloperScopes defines the strictly bounded permissions assigned to developer sandbox keys.
+// Wildcard scopes ("*"), administrative scopes, and operator privileges are strictly prohibited.
+var SandboxDeveloperScopes = []string{
+	"sandbox:read",
+	"sandbox:write",
+	"compute:read",
+	"compute:write",
+	"dns:read",
+	"dns:write",
+	"billing:read",
+	"orders:write",
+	"storage:read",
+	"storage:write",
+	"events:read",
+	"events:write",
+	"webhooks:read",
+	"webhooks:write",
+}
+
 // Authenticator validates JWT tokens and Scoped API Keys.
 type Authenticator struct {
 	mu        sync.RWMutex
@@ -104,6 +123,7 @@ func (a *Authenticator) validateAPIKey(key string) (*TenantContext, error) {
 	}
 
 	// Auto-provision hermetic sandbox tenant for developer test keys (aeitron_test_... / ak_test_...)
+	// Strictly assign bounded non-admin scopes. Wildcards ("*") and administrative roles are forbidden.
 	if isTestPrefix {
 		tenantID := "test_sandbox"
 		parts := strings.Split(key, "_")
@@ -114,16 +134,18 @@ func (a *Authenticator) validateAPIKey(key string) (*TenantContext, error) {
 		if limit > 24 {
 			limit = 24
 		}
+		boundedScopes := make([]string, len(SandboxDeveloperScopes))
+		copy(boundedScopes, SandboxDeveloperScopes)
 		return &TenantContext{
 			TenantID:  tenantID,
 			OrgID:     "org_sandbox",
 			ProjectID: "proj_sandbox",
 			ActorID:   "act_" + key[:limit],
 			Role:      "developer",
-			Scopes:    []string{"*"},
-			Tier:      "enterprise",
+			Scopes:    boundedScopes,
+			Tier:      "developer",
 			Livemode:  false,
-			ExpiresAt: time.Now().UTC().Add(365 * 24 * time.Hour),
+			ExpiresAt: time.Now().UTC().Add(30 * 24 * time.Hour),
 		}, nil
 	}
 

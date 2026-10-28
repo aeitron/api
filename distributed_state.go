@@ -3,6 +3,7 @@ package apigateway
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"math"
 	"net"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -187,7 +189,7 @@ func (m *MemoryStateAdapter) Close() error {
 // 2. Redis & KeyDB Cluster State Adapter (Standard Library RESP Client)
 // ---------------------------------------------------------------------------
 
-// RedisConfig tunes connection pooling and network timeouts.
+// RedisConfig tunes connection pooling, TLS security, and network timeouts.
 type RedisConfig struct {
 	Addr        string
 	Password    string
@@ -195,6 +197,9 @@ type RedisConfig struct {
 	PoolSize    int
 	DialTimeout time.Duration
 	ReadTimeout time.Duration
+	UseTLS      bool
+	TLSConfig   *tls.Config
+	FailClosed  bool
 }
 
 // DefaultRedisConfig returns resilient production defaults.
@@ -226,12 +231,15 @@ type redisConn struct {
 
 // NewRedisStateAdapter parses REDIS_URL and connects to Redis or KeyDB cluster nodes.
 func NewRedisStateAdapter(redisURL string, cfg RedisConfig, metrics *MetricsCollector) (*RedisStateAdapter, error) {
-	parsedAddr, password, db, err := parseRedisURL(redisURL)
+	parsedAddr, password, db, useTLS, err := parseRedisURL(redisURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid redis url: %w", err)
 	}
 
 	cfg.Addr = parsedAddr
+	if useTLS {
+		cfg.UseTLS = true
+	}
 	if password != "" {
 		cfg.Password = password
 	}
@@ -246,6 +254,9 @@ func NewRedisStateAdapter(redisURL string, cfg RedisConfig, metrics *MetricsColl
 	}
 	if cfg.ReadTimeout <= 0 {
 		cfg.ReadTimeout = 1 * time.Second
+	}
+	if strings.EqualFold(os.Getenv("AEITRON_CLUSTER_FAIL_CLOSED"), "true") || strings.EqualFold(os.Getenv("AEITRON_CLUSTER_FAIL_CLOSED"), "1") {
+		cfg.FailClosed = true
 	}
 
 	adapter := &RedisStateAdapter{
@@ -266,21 +277,29 @@ func NewRedisStateAdapter(redisURL string, cfg RedisConfig, metrics *MetricsColl
 	return adapter, nil
 }
 
-func parseRedisURL(raw string) (addr string, password string, db int, err error) {
+func parseRedisURL(raw string) (addr string, password string, db int, useTLS bool, err error) {
 	raw = strings.TrimSpace(raw)
 	if !strings.HasPrefix(raw, "redis://") && !strings.HasPrefix(raw, "rediss://") {
 		// Bare host:port format
-		return raw, "", 0, nil
+		return raw, "", 0, false, nil
 	}
 
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", "", 0, err
+		return "", "", 0, false, err
+	}
+
+	if strings.EqualFold(u.Scheme, "rediss") {
+		useTLS = true
 	}
 
 	addr = u.Host
 	if !strings.Contains(addr, ":") {
-		addr += ":6379"
+		if useTLS {
+			addr += ":6380"
+		} else {
+			addr += ":6379"
+		}
 	}
 
 	if u.User != nil {
@@ -299,7 +318,7 @@ func parseRedisURL(raw string) (addr string, password string, db int, err error)
 		}
 	}
 
-	return addr, password, db, nil
+	return addr, password, db, useTLS, nil
 }
 
 func (r *RedisStateAdapter) Name() string {
@@ -320,7 +339,30 @@ func (r *RedisStateAdapter) getConn(ctx context.Context) (*redisConn, error) {
 	if r.connCount.Load() < int32(r.cfg.PoolSize) {
 		r.connCount.Add(1)
 		d := net.Dialer{Timeout: r.cfg.DialTimeout}
-		raw, err := d.DialContext(ctx, "tcp", r.cfg.Addr)
+		var raw net.Conn
+		var err error
+
+		if r.cfg.UseTLS {
+			tlsConf := r.cfg.TLSConfig
+			if tlsConf == nil {
+				host, _, splitErr := net.SplitHostPort(r.cfg.Addr)
+				if splitErr != nil {
+					host = r.cfg.Addr
+				}
+				tlsConf = &tls.Config{
+					ServerName: host,
+					MinVersion: tls.VersionTLS12,
+				}
+			}
+			tlsDialer := &tls.Dialer{
+				NetDialer: &d,
+				Config:    tlsConf,
+			}
+			raw, err = tlsDialer.DialContext(ctx, "tcp", r.cfg.Addr)
+		} else {
+			raw, err = d.DialContext(ctx, "tcp", r.cfg.Addr)
+		}
+
 		if err != nil {
 			r.connCount.Add(-1)
 			return nil, err
@@ -435,9 +477,11 @@ func (r *RedisStateAdapter) Ping(ctx context.Context) error {
 func (r *RedisStateAdapter) Get(ctx context.Context, key string) ([]byte, error) {
 	conn, err := r.getConn(ctx)
 	if err != nil {
-		// Fail-open fallback to local memory
 		if r.metrics != nil {
 			r.metrics.RecordClusterOp("get_fallback")
+		}
+		if r.cfg.FailClosed {
+			return nil, fmt.Errorf("%w: failed to connect to redis", ErrClusterUnavailable)
 		}
 		return r.fallback.Get(ctx, key)
 	}
@@ -446,12 +490,18 @@ func (r *RedisStateAdapter) Get(ctx context.Context, key string) ([]byte, error)
 	err = writeRESPCommand(conn.writer, "GET", key)
 	if err != nil {
 		r.putConn(conn, err)
+		if r.cfg.FailClosed {
+			return nil, fmt.Errorf("%w: write command failed", ErrClusterUnavailable)
+		}
 		return r.fallback.Get(ctx, key)
 	}
 
 	reply, err := readRESPReply(conn.reader)
 	r.putConn(conn, err)
 	if err != nil {
+		if r.cfg.FailClosed {
+			return nil, fmt.Errorf("%w: read reply failed", ErrClusterUnavailable)
+		}
 		return r.fallback.Get(ctx, key)
 	}
 
@@ -474,13 +524,17 @@ func (r *RedisStateAdapter) Get(ctx context.Context, key string) ([]byte, error)
 }
 
 func (r *RedisStateAdapter) Set(ctx context.Context, key string, val []byte, ttl time.Duration) error {
-	// Sync both to local fallback and Redis cluster
-	_ = r.fallback.Set(ctx, key, val, ttl)
+	if !r.cfg.FailClosed {
+		_ = r.fallback.Set(ctx, key, val, ttl)
+	}
 
 	conn, err := r.getConn(ctx)
 	if err != nil {
 		if r.metrics != nil {
 			r.metrics.RecordClusterOp("set_fallback")
+		}
+		if r.cfg.FailClosed {
+			return fmt.Errorf("%w: failed to connect to redis", ErrClusterUnavailable)
 		}
 		return nil // Fail-open: successfully updated local memory
 	}
@@ -499,6 +553,9 @@ func (r *RedisStateAdapter) Set(ctx context.Context, key string, val []byte, ttl
 
 	if cmdErr != nil {
 		r.putConn(conn, cmdErr)
+		if r.cfg.FailClosed {
+			return fmt.Errorf("%w: failed to set redis key", ErrClusterUnavailable)
+		}
 		return nil // Fail-open
 	}
 
@@ -578,9 +635,12 @@ func (r *RedisStateAdapter) DeletePrefix(ctx context.Context, prefix string) (in
 func (r *RedisStateAdapter) RateLimitAllow(ctx context.Context, key string, rate float64, capacity int) (bool, int, time.Duration, error) {
 	conn, err := r.getConn(ctx)
 	if err != nil {
-		// Fail-open: fall back to ultra-fast local in-memory token bucket
+		// Fail-open: fall back to ultra-fast local in-memory token bucket unless fail-closed is configured
 		if r.metrics != nil {
 			r.metrics.RecordClusterOp("ratelimit_fallback")
+		}
+		if r.cfg.FailClosed {
+			return false, 0, 1 * time.Second, fmt.Errorf("%w: failed to connect to redis in fail-closed mode", ErrClusterUnavailable)
 		}
 		return r.fallback.RateLimitAllow(ctx, key, rate, capacity)
 	}
@@ -621,17 +681,26 @@ end`
 		fmt.Sprintf("%.4f", rate), strconv.Itoa(capacity), strconv.FormatInt(now, 10))
 	if cmdErr != nil {
 		r.putConn(conn, cmdErr)
+		if r.cfg.FailClosed {
+			return false, 0, 1 * time.Second, fmt.Errorf("%w: eval sha failed", ErrClusterUnavailable)
+		}
 		return r.fallback.RateLimitAllow(ctx, key, rate, capacity)
 	}
 
 	reply, readErr := readRESPReply(conn.reader)
 	r.putConn(conn, readErr)
 	if readErr != nil {
+		if r.cfg.FailClosed {
+			return false, 0, 1 * time.Second, fmt.Errorf("%w: read redis reply failed", ErrClusterUnavailable)
+		}
 		return r.fallback.RateLimitAllow(ctx, key, rate, capacity)
 	}
 
 	arr, ok := reply.([]interface{})
 	if !ok || len(arr) < 3 {
+		if r.cfg.FailClosed {
+			return false, 0, 1 * time.Second, fmt.Errorf("%w: invalid redis reply shape", ErrClusterUnavailable)
+		}
 		return r.fallback.RateLimitAllow(ctx, key, rate, capacity)
 	}
 
@@ -653,6 +722,9 @@ end`
 func (r *RedisStateAdapter) IdempotencyAcquire(ctx context.Context, key string, payloadHash string, ttl time.Duration) (bool, *IdempotencyRecord, error) {
 	conn, err := r.getConn(ctx)
 	if err != nil {
+		if r.cfg.FailClosed {
+			return false, nil, fmt.Errorf("%w: failed to connect to redis in fail-closed mode", ErrClusterUnavailable)
+		}
 		return r.fallback.IdempotencyAcquire(ctx, key, payloadHash, ttl)
 	}
 
@@ -676,12 +748,18 @@ func (r *RedisStateAdapter) IdempotencyAcquire(ctx context.Context, key string, 
 	cmdErr := writeRESPCommand(conn.writer, "SET", redisKey, string(bytesVal), "NX", "PX", strconv.Itoa(ttlMs))
 	if cmdErr != nil {
 		r.putConn(conn, cmdErr)
+		if r.cfg.FailClosed {
+			return false, nil, fmt.Errorf("%w: idempotency acquire failed", ErrClusterUnavailable)
+		}
 		return r.fallback.IdempotencyAcquire(ctx, key, payloadHash, ttl)
 	}
 
 	reply, readErr := readRESPReply(conn.reader)
 	if readErr != nil {
 		r.putConn(conn, readErr)
+		if r.cfg.FailClosed {
+			return false, nil, fmt.Errorf("%w: read idempotency reply failed", ErrClusterUnavailable)
+		}
 		return r.fallback.IdempotencyAcquire(ctx, key, payloadHash, ttl)
 	}
 
@@ -720,10 +798,15 @@ func (r *RedisStateAdapter) IdempotencyAcquire(ctx context.Context, key string, 
 
 // IdempotencyComplete stores the final completed mutation state in Redis.
 func (r *RedisStateAdapter) IdempotencyComplete(ctx context.Context, key string, record *IdempotencyRecord, ttl time.Duration) error {
-	_ = r.fallback.IdempotencyComplete(ctx, key, record, ttl)
+	if !r.cfg.FailClosed {
+		_ = r.fallback.IdempotencyComplete(ctx, key, record, ttl)
+	}
 
 	conn, err := r.getConn(ctx)
 	if err != nil {
+		if r.cfg.FailClosed {
+			return fmt.Errorf("%w: failed to connect to redis in fail-closed mode", ErrClusterUnavailable)
+		}
 		return nil
 	}
 
@@ -739,6 +822,9 @@ func (r *RedisStateAdapter) IdempotencyComplete(ctx context.Context, key string,
 	cmdErr := writeRESPCommand(conn.writer, "SET", redisKey, string(bytesVal), "EX", strconv.Itoa(sec))
 	if cmdErr != nil {
 		r.putConn(conn, cmdErr)
+		if r.cfg.FailClosed {
+			return fmt.Errorf("%w: failed to store completed idempotency state", ErrClusterUnavailable)
+		}
 		return nil
 	}
 

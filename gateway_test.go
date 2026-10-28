@@ -2176,10 +2176,19 @@ func TestWebhook_SubscriptionManagement(t *testing.T) {
 	gw := NewAPIGateway("test-secret-32-bytes")
 	defer gw.Close()
 
+	authTok, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "act_alpha",
+		TenantID: "tenant_alpha",
+		Role:     "developer",
+		Scopes:   []string{"webhooks:read", "webhooks:write"},
+		Exp:      time.Now().Add(time.Hour).Unix(),
+	})
+	authBearer := "Bearer " + authTok
+
 	// 1. Reject unsafe URL (SSRF defense against cloud metadata IP)
 	subReqJSON := `{"url":"http://169.254.169.254/latest/meta-data","events":["deployment.*"]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks/subscriptions", strings.NewReader(subReqJSON))
-	req.Header.Set("X-Tenant-ID", "tenant_alpha")
+	req.Header.Set("Authorization", authBearer)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	gw.ServeHTTP(rec, req)
@@ -2191,7 +2200,7 @@ func TestWebhook_SubscriptionManagement(t *testing.T) {
 	// 2. Register valid webhook subscription
 	validSubJSON := `{"url":"https://example.com/webhooks","events":["deployment.*","invoice.paid"]}`
 	req = httptest.NewRequest(http.MethodPost, "/v1/webhooks/subscriptions", strings.NewReader(validSubJSON))
-	req.Header.Set("X-Tenant-ID", "tenant_alpha")
+	req.Header.Set("Authorization", authBearer)
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	gw.ServeHTTP(rec, req)
@@ -2216,7 +2225,7 @@ func TestWebhook_SubscriptionManagement(t *testing.T) {
 
 	// 3. Retrieve subscription by ID
 	req = httptest.NewRequest(http.MethodGet, "/v1/webhooks/subscriptions/"+subID, nil)
-	req.Header.Set("X-Tenant-ID", "tenant_alpha")
+	req.Header.Set("Authorization", authBearer)
 	rec = httptest.NewRecorder()
 	gw.ServeHTTP(rec, req)
 
@@ -2226,7 +2235,7 @@ func TestWebhook_SubscriptionManagement(t *testing.T) {
 
 	// 4. List subscriptions
 	req = httptest.NewRequest(http.MethodGet, "/v1/webhooks/subscriptions", nil)
-	req.Header.Set("X-Tenant-ID", "tenant_alpha")
+	req.Header.Set("Authorization", authBearer)
 	rec = httptest.NewRecorder()
 	gw.ServeHTTP(rec, req)
 
@@ -2246,7 +2255,7 @@ func TestWebhook_SubscriptionManagement(t *testing.T) {
 
 	// 5. Delete subscription
 	req = httptest.NewRequest(http.MethodDelete, "/v1/webhooks/subscriptions/"+subID, nil)
-	req.Header.Set("X-Tenant-ID", "tenant_alpha")
+	req.Header.Set("Authorization", authBearer)
 	rec = httptest.NewRecorder()
 	gw.ServeHTTP(rec, req)
 
@@ -2256,7 +2265,7 @@ func TestWebhook_SubscriptionManagement(t *testing.T) {
 
 	// 6. Verify deleted (404)
 	req = httptest.NewRequest(http.MethodGet, "/v1/webhooks/subscriptions/"+subID, nil)
-	req.Header.Set("X-Tenant-ID", "tenant_alpha")
+	req.Header.Set("Authorization", authBearer)
 	rec = httptest.NewRecorder()
 	gw.ServeHTTP(rec, req)
 
@@ -2317,12 +2326,21 @@ func TestWebhook_AsynchronousDelivery(t *testing.T) {
 	}
 
 	// Dispatch event via API
+	authTok, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "act_beta",
+		TenantID: "tenant_beta",
+		Role:     "developer",
+		Scopes:   []string{"webhooks:read", "webhooks:write"},
+		Exp:      time.Now().Add(time.Hour).Unix(),
+	})
+	authBearer := "Bearer " + authTok
+
 	dispatchJSON := `{
 		"type": "deployment.succeeded",
 		"data": { "service": "edge-router", "version": "v2.4.1" }
 	}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks/dispatch", strings.NewReader(dispatchJSON))
-	req.Header.Set("X-Tenant-ID", "tenant_beta")
+	req.Header.Set("Authorization", authBearer)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	gw.ServeHTTP(rec, req)
@@ -2374,7 +2392,7 @@ func TestWebhook_AsynchronousDelivery(t *testing.T) {
 
 	// Check delivery history via API
 	req = httptest.NewRequest(http.MethodGet, "/v1/webhooks/deliveries", nil)
-	req.Header.Set("X-Tenant-ID", "tenant_beta")
+	req.Header.Set("Authorization", authBearer)
 	rec = httptest.NewRecorder()
 	gw.ServeHTTP(rec, req)
 
@@ -2529,8 +2547,17 @@ func TestWebhook_DeadLetterQueueAndRedelivery(t *testing.T) {
 	engine.WaitIdle(2 * time.Second)
 
 	// Verify DLQ via API
+	dlqTok, _ := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "act_dlq",
+		TenantID: "tenant_dlq",
+		Role:     "developer",
+		Scopes:   []string{"webhooks:read", "webhooks:write"},
+		Exp:      time.Now().Add(time.Hour).Unix(),
+	})
+	dlqBearer := "Bearer " + dlqTok
+
 	req := httptest.NewRequest(http.MethodGet, "/v1/webhooks/dead-letter", nil)
-	req.Header.Set("X-Tenant-ID", "tenant_dlq")
+	req.Header.Set("Authorization", dlqBearer)
 	rec := httptest.NewRecorder()
 	gw.ServeHTTP(rec, req)
 
@@ -2555,7 +2582,7 @@ func TestWebhook_DeadLetterQueueAndRedelivery(t *testing.T) {
 	// Trigger redelivery via POST /v1/webhooks/dead-letter/retry
 	retryBody := fmt.Sprintf(`{"delivery_id":"%s"}`, deadDeliveryID)
 	req = httptest.NewRequest(http.MethodPost, "/v1/webhooks/dead-letter/retry", strings.NewReader(retryBody))
-	req.Header.Set("X-Tenant-ID", "tenant_dlq")
+	req.Header.Set("Authorization", dlqBearer)
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	gw.ServeHTTP(rec, req)
