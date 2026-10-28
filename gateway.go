@@ -531,10 +531,46 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		gw.metrics.RecordRequest(r.Method, "/metrics", http.StatusOK, time.Since(start))
 		return
 	}
-	if r.URL.Path == "/healthz" || r.URL.Path == "/ready" {
+	if r.URL.Path == "/healthz" {
 		writeJSONResponse(w, http.StatusOK, map[string]string{
 			"status":  "healthy",
 			"service": "aeitron-api-gateway",
+			"time":    time.Now().UTC().Format(time.RFC3339),
+		})
+		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
+		return
+	}
+	if r.URL.Path == "/ready" {
+		// Deep readiness probe: verify cluster state adapter connectivity
+		gw.mu.RLock()
+		adapter := gw.stateAdapter
+		gw.mu.RUnlock()
+
+		ready := true
+		statusMsg := "ready"
+		adapterName := "memory"
+
+		if adapter != nil {
+			adapterName = adapter.Name()
+			pingCtx, pingCancel := context.WithTimeout(r.Context(), 1*time.Second)
+			err := adapter.Ping(pingCtx)
+			pingCancel()
+			if err != nil {
+				ready = false
+				statusMsg = fmt.Sprintf("state cluster %s unreachable: %v", adapterName, err)
+			}
+		}
+
+		if !ready {
+			WriteProblem(w, r, http.StatusServiceUnavailable, "Service Unavailable", statusMsg, "NOT_READY")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusServiceUnavailable, time.Since(start))
+			return
+		}
+
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"status":  "ready",
+			"service": "aeitron-api-gateway",
+			"adapter": adapterName,
 			"time":    time.Now().UTC().Format(time.RFC3339),
 		})
 		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
@@ -717,17 +753,33 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. Built-in Webhook Engine Endpoints (/v1/webhooks/...)
+	// 5. IP-Level Token Bucket Rate Limiting (Protects all internal and proxy routes against IP floods)
+	clientIP := extractClientIP(r)
+	ipTier := DefaultRateLimits["ip_default"]
+	rlSpan := tc.StartSpan("gateway.ratelimit", "INTERNAL")
+	rlSpan.SetAttribute("ratelimit.key", "ip:"+clientIP)
+	allowed, ipRemaining, retryAfter := gw.limiter.Allow("ip:"+clientIP, ipTier.RequestsPerSecond, ipTier.BurstCapacity)
+	if !allowed {
+		tc.EndSpan(rlSpan, http.StatusTooManyRequests, map[string]string{"ratelimit.allowed": "false"})
+		atomic.AddInt64(&gw.stats.RateLimitedCount, 1)
+		gw.metrics.RecordRateLimit("ip")
+		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusTooManyRequests, time.Since(start))
+		WriteRateLimited(w, r, "too many requests from this IP: rate limit exceeded", int(retryAfter.Seconds()))
+		return
+	}
+	tc.EndSpan(rlSpan, http.StatusOK, map[string]string{"ratelimit.allowed": "true"})
+
+	// 5.1. Built-in Webhook Engine Endpoints (/v1/webhooks/...)
 	if gw.handleWebhookEndpoints(w, r, start) {
 		return
 	}
 
-	// 5.5. Built-in Real-Time Events Engine Endpoints (/v1/events/...)
+	// 5.2. Built-in Real-Time Events Engine Endpoints (/v1/events/...)
 	if gw.handleEventEndpoints(w, r, start) {
 		return
 	}
 
-	// 5.6. Built-in Sandbox Simulation Endpoints (/v1/sandbox/...)
+	// 5.3. Built-in Sandbox Simulation Endpoints (/v1/sandbox/...)
 	if strings.HasPrefix(r.URL.Path, "/v1/sandbox") || strings.HasPrefix(r.URL.Path, "/sandbox") {
 		var tCtx *TenantContext
 		if authCtx, err := gw.authenticator.AuthenticateRequest(r); err == nil {
@@ -739,7 +791,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 6. Built-in Local Fast Token Issuance (/v1/auth/token)
+	// 5.4. Built-in Local Fast Token Issuance (/v1/auth/token)
 	if r.URL.Path == "/v1/auth/token" && r.Method == http.MethodPost {
 		var tokenReq struct {
 			ClientID     string `json:"client_id"`
@@ -790,22 +842,6 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	// 5. IP-Level Token Bucket Rate Limiting
-	clientIP := extractClientIP(r)
-	ipTier := DefaultRateLimits["ip_default"]
-	rlSpan := tc.StartSpan("gateway.ratelimit", "INTERNAL")
-	rlSpan.SetAttribute("ratelimit.key", "ip:"+clientIP)
-	allowed, remaining, retryAfter := gw.limiter.Allow("ip:"+clientIP, ipTier.RequestsPerSecond, ipTier.BurstCapacity)
-	if !allowed {
-		tc.EndSpan(rlSpan, http.StatusTooManyRequests, map[string]string{"ratelimit.allowed": "false"})
-		atomic.AddInt64(&gw.stats.RateLimitedCount, 1)
-		gw.metrics.RecordRateLimit("ip")
-		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusTooManyRequests, time.Since(start))
-		WriteRateLimited(w, r, "too many requests from this IP: rate limit exceeded", int(retryAfter.Seconds()))
-		return
-	}
-	tc.EndSpan(rlSpan, http.StatusOK, map[string]string{"ratelimit.allowed": "true"})
 
 	// 6. Route Resolution
 	rule, proxy := gw.matchRoute(r.URL.Path)
@@ -886,7 +922,7 @@ func (gw *APIGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		tc.EndSpan(tenantRlSpan, http.StatusOK, map[string]string{"ratelimit.allowed": "true"})
 	} else {
-		w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
+		w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%d", ipRemaining))
 	}
 
 	// 10. Stripe-grade Idempotency-Key Engine (Mutation Protection)
@@ -1180,6 +1216,13 @@ func writeJSONResponse(w http.ResponseWriter, status int, data interface{}) {
 	_ = json.NewEncoder(w).Encode(data)
 }
 
+func maskWebhookSecret(s string) string {
+	if s == "" {
+		return ""
+	}
+	return "whsec_****************"
+}
+
 func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Request, start time.Time) bool {
 	if !strings.HasPrefix(r.URL.Path, "/v1/webhooks") && !strings.HasPrefix(r.URL.Path, "/webhooks") {
 		return false
@@ -1203,8 +1246,30 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 	}
 	tenantID := authCtx.TenantID
 
+	// Enforce tenant-tier token bucket rate limits
+	tier := authCtx.Tier
+	tierLimits, ok := DefaultRateLimits[tier]
+	if !ok {
+		tierLimits = DefaultRateLimits["tier_free"]
+	}
+	allowed, _, retryAfter := gw.limiter.Allow("tenant:"+tenantID+":webhooks", tierLimits.RequestsPerSecond, tierLimits.BurstCapacity)
+	if !allowed {
+		gw.metrics.RecordRateLimit(tier)
+		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusTooManyRequests, time.Since(start))
+		WriteRateLimited(w, r, "rate limit exceeded for tier "+tier, int(retryAfter.Seconds()))
+		return true
+	}
+
+	canRead := authCtx.Role == "admin" || authCtx.Role == "operator" || CheckScopes(authCtx.Scopes, []string{"webhooks:read"})
+	canWrite := authCtx.Role == "admin" || authCtx.Role == "operator" || CheckScopes(authCtx.Scopes, []string{"webhooks:write"})
+
 	// 0.5. POST /v1/webhooks/test (Interactive Webhook Simulation Engine)
 	if r.URL.Path == "/v1/webhooks/test" && r.Method == http.MethodPost {
+		if !canWrite {
+			WriteForbidden(w, r, "forbidden: missing required scope 'webhooks:write'")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+			return true
+		}
 		var testReq struct {
 			URL       string          `json:"url"`
 			Secret    string          `json:"secret"`
@@ -1229,6 +1294,11 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 
 	// 1. POST /v1/webhooks/subscriptions (Create subscription)
 	if r.URL.Path == "/v1/webhooks/subscriptions" && r.Method == http.MethodPost {
+		if !canWrite {
+			WriteForbidden(w, r, "forbidden: missing required scope 'webhooks:write'")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+			return true
+		}
 		var req CreateSubscriptionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			WriteBadRequest(w, r, fmt.Sprintf("invalid request payload: %v", err), "INVALID_PAYLOAD")
@@ -1248,19 +1318,58 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 		return true
 	}
 
-	// 2. GET /v1/webhooks/subscriptions (List subscriptions)
-	if r.URL.Path == "/v1/webhooks/subscriptions" && r.Method == http.MethodGet {
-		subs := gw.webhookEngine.ListSubscriptions(tenantID)
+	// 1.5. POST /v1/webhooks/subscriptions/{id}/rotate-secret (Rotate HMAC secret)
+	if strings.HasPrefix(r.URL.Path, "/v1/webhooks/subscriptions/") && strings.HasSuffix(r.URL.Path, "/rotate-secret") && r.Method == http.MethodPost {
+		if !canWrite {
+			WriteForbidden(w, r, "forbidden: missing required scope 'webhooks:write'")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+			return true
+		}
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/webhooks/subscriptions/"), "/rotate-secret")
+		newSecret, err := gw.webhookEngine.RotateSecret(tenantID, id)
+		if err != nil {
+			WriteNotFound(w, r, "webhook subscription not found")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusNotFound, time.Since(start))
+			return true
+		}
 		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
-			"subscriptions": subs,
-			"count":         len(subs),
+			"status": "rotated",
+			"id":     id,
+			"secret": newSecret,
 		})
 		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
 		return true
 	}
 
-	// 3. GET /v1/webhooks/subscriptions/{id} (Get subscription by ID)
-	if strings.HasPrefix(r.URL.Path, "/v1/webhooks/subscriptions/") && r.Method == http.MethodGet {
+	// 2. GET /v1/webhooks/subscriptions (List subscriptions - secret redacted)
+	if r.URL.Path == "/v1/webhooks/subscriptions" && r.Method == http.MethodGet {
+		if !canRead {
+			WriteForbidden(w, r, "forbidden: missing required scope 'webhooks:read'")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+			return true
+		}
+		subs := gw.webhookEngine.ListSubscriptions(tenantID)
+		maskedSubs := make([]*WebhookSubscription, len(subs))
+		for i, s := range subs {
+			cp := *s
+			cp.Secret = maskWebhookSecret(cp.Secret)
+			maskedSubs[i] = &cp
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"subscriptions": maskedSubs,
+			"count":         len(maskedSubs),
+		})
+		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
+		return true
+	}
+
+	// 3. GET /v1/webhooks/subscriptions/{id} (Get subscription by ID - secret redacted)
+	if strings.HasPrefix(r.URL.Path, "/v1/webhooks/subscriptions/") && !strings.HasSuffix(r.URL.Path, "/rotate-secret") && r.Method == http.MethodGet {
+		if !canRead {
+			WriteForbidden(w, r, "forbidden: missing required scope 'webhooks:read'")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+			return true
+		}
 		id := strings.TrimPrefix(r.URL.Path, "/v1/webhooks/subscriptions/")
 		sub, err := gw.webhookEngine.GetSubscription(tenantID, id)
 		if err != nil {
@@ -1268,8 +1377,10 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusNotFound, time.Since(start))
 			return true
 		}
+		subCopy := *sub
+		subCopy.Secret = maskWebhookSecret(subCopy.Secret)
 		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
-			"subscription": sub,
+			"subscription": &subCopy,
 		})
 		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusOK, time.Since(start))
 		return true
@@ -1277,6 +1388,11 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 
 	// 4. DELETE /v1/webhooks/subscriptions/{id} (Delete subscription by ID)
 	if strings.HasPrefix(r.URL.Path, "/v1/webhooks/subscriptions/") && r.Method == http.MethodDelete {
+		if !canWrite {
+			WriteForbidden(w, r, "forbidden: missing required scope 'webhooks:write'")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+			return true
+		}
 		id := strings.TrimPrefix(r.URL.Path, "/v1/webhooks/subscriptions/")
 		err := gw.webhookEngine.DeleteSubscription(tenantID, id)
 		if err != nil {
@@ -1294,6 +1410,11 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 
 	// 5. POST /v1/webhooks/dispatch (Dispatch asynchronous cloud event notification)
 	if r.URL.Path == "/v1/webhooks/dispatch" && r.Method == http.MethodPost {
+		if !canWrite {
+			WriteForbidden(w, r, "forbidden: missing required scope 'webhooks:write'")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+			return true
+		}
 		var event WebhookEvent
 		if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
 			WriteBadRequest(w, r, fmt.Sprintf("invalid event payload: %v", err), "INVALID_PAYLOAD")
@@ -1341,6 +1462,11 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 
 	// 6. GET /v1/webhooks/deliveries (List delivery history)
 	if r.URL.Path == "/v1/webhooks/deliveries" && r.Method == http.MethodGet {
+		if !canRead {
+			WriteForbidden(w, r, "forbidden: missing required scope 'webhooks:read'")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+			return true
+		}
 		deliveries := gw.webhookEngine.ListDeliveries(tenantID)
 		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
 			"deliveries": deliveries,
@@ -1352,6 +1478,11 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 
 	// 7. GET /v1/webhooks/dead-letter (List dead letter queue)
 	if r.URL.Path == "/v1/webhooks/dead-letter" && r.Method == http.MethodGet {
+		if !canRead {
+			WriteForbidden(w, r, "forbidden: missing required scope 'webhooks:read'")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+			return true
+		}
 		deadLetters := gw.webhookEngine.ListDeadLetters(tenantID)
 		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
 			"dead_letters": deadLetters,
@@ -1363,6 +1494,11 @@ func (gw *APIGateway) handleWebhookEndpoints(w http.ResponseWriter, r *http.Requ
 
 	// 8. POST /v1/webhooks/dead-letter/retry (Redeliver failed webhook from DLQ)
 	if r.URL.Path == "/v1/webhooks/dead-letter/retry" && r.Method == http.MethodPost {
+		if !canWrite {
+			WriteForbidden(w, r, "forbidden: missing required scope 'webhooks:write'")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+			return true
+		}
 		var retryReq struct {
 			DeliveryID string `json:"delivery_id"`
 		}
@@ -1418,14 +1554,36 @@ func (gw *APIGateway) handleEventEndpoints(w http.ResponseWriter, r *http.Reques
 
 	authCtx, authErr := gw.authenticator.AuthenticateRequest(r)
 	if authErr != nil || authCtx == nil {
-		WriteUnauthorized(w, r, "unauthorized: authentication required for webhook operations")
+		WriteUnauthorized(w, r, "unauthorized: authentication required for event operations")
 		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusUnauthorized, time.Since(start))
 		return true
 	}
 	tenantID := authCtx.TenantID
 
+	// Enforce tenant-tier token bucket rate limits
+	tier := authCtx.Tier
+	tierLimits, ok := DefaultRateLimits[tier]
+	if !ok {
+		tierLimits = DefaultRateLimits["tier_free"]
+	}
+	allowed, _, retryAfter := gw.limiter.Allow("tenant:"+tenantID+":events", tierLimits.RequestsPerSecond, tierLimits.BurstCapacity)
+	if !allowed {
+		gw.metrics.RecordRateLimit(tier)
+		gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusTooManyRequests, time.Since(start))
+		WriteRateLimited(w, r, "rate limit exceeded for tier "+tier, int(retryAfter.Seconds()))
+		return true
+	}
+
+	canRead := authCtx.Role == "admin" || authCtx.Role == "operator" || CheckScopes(authCtx.Scopes, []string{"events:read"})
+	canWrite := authCtx.Role == "admin" || authCtx.Role == "operator" || CheckScopes(authCtx.Scopes, []string{"events:write"})
+
 	// 1. GET /v1/events/stream or /events/stream (Server-Sent Events Real-Time Streaming)
 	if (r.URL.Path == "/v1/events/stream" || r.URL.Path == "/events/stream") && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		if !canRead {
+			WriteForbidden(w, r, "forbidden: missing required scope 'events:read'")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+			return true
+		}
 		if gw.eventEngine == nil {
 			WriteProblem(w, r, http.StatusServiceUnavailable, "Service Unavailable", "events streaming engine is not initialized", "SERVICE_UNAVAILABLE")
 			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusServiceUnavailable, time.Since(start))
@@ -1438,6 +1596,11 @@ func (gw *APIGateway) handleEventEndpoints(w http.ResponseWriter, r *http.Reques
 
 	// 2. POST /v1/events/publish or /events/publish (Broadcast event to real-time subscribers & history)
 	if (r.URL.Path == "/v1/events/publish" || r.URL.Path == "/events/publish") && r.Method == http.MethodPost {
+		if !canWrite {
+			WriteForbidden(w, r, "forbidden: missing required scope 'events:write'")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+			return true
+		}
 		if gw.eventEngine == nil {
 			WriteProblem(w, r, http.StatusServiceUnavailable, "Service Unavailable", "events streaming engine is not initialized", "SERVICE_UNAVAILABLE")
 			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusServiceUnavailable, time.Since(start))
@@ -1482,6 +1645,11 @@ func (gw *APIGateway) handleEventEndpoints(w http.ResponseWriter, r *http.Reques
 
 	// 3. GET /v1/events/history or /events/history (Query recent event ring buffer)
 	if (r.URL.Path == "/v1/events/history" || r.URL.Path == "/events/history") && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		if !canRead {
+			WriteForbidden(w, r, "forbidden: missing required scope 'events:read'")
+			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusForbidden, time.Since(start))
+			return true
+		}
 		if gw.eventEngine == nil {
 			WriteProblem(w, r, http.StatusServiceUnavailable, "Service Unavailable", "events streaming engine is not initialized", "SERVICE_UNAVAILABLE")
 			gw.metrics.RecordRequest(r.Method, r.URL.Path, http.StatusServiceUnavailable, time.Since(start))

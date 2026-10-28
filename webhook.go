@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -215,6 +217,70 @@ type WebhookEngine struct {
 	activeSubs atomic.Int64
 }
 
+// NewSafeWebhookClient returns a hardened HTTP client with strict SSRF defenses:
+// 1. Rejects HTTP redirects to prevent open-redirect SSRF targeting internal/metadata services.
+// 2. Enforces connection-time DNS resolution and IP verification to block private, loopback, and cloud metadata IPs.
+func NewSafeWebhookClient(timeout time.Duration) *http.Client {
+	isDev := strings.EqualFold(os.Getenv("AEITRON_DEV_MODE"), "true") || strings.EqualFold(os.Getenv("AEITRON_ENV"), "development")
+
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+
+			// Reject cloud provider metadata endpoints unconditionally
+			if host == "169.254.169.254" || host == "metadata.google.internal" || host == "instance-data" {
+				return nil, errors.New("connection to cloud provider instance metadata is prohibited (SSRF defense)")
+			}
+
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				ip := net.ParseIP(host)
+				if ip != nil {
+					ips = []net.IPAddr{{IP: ip}}
+				} else {
+					return nil, fmt.Errorf("could not resolve webhook target host %q: %w", host, err)
+				}
+			}
+
+			var safeIP *net.IPAddr
+			for _, ipAddr := range ips {
+				if isPrivateIP(ipAddr.IP) {
+					if isDev && (ipAddr.IP.IsLoopback() || strings.HasPrefix(ipAddr.IP.String(), "127.")) {
+						safeIP = &ipAddr
+						break
+					}
+					return nil, fmt.Errorf("connection to prohibited private/link-local IP %s (%s) blocked (SSRF defense)", ipAddr.IP.String(), host)
+				}
+				if safeIP == nil {
+					safeIP = &ipAddr
+				}
+			}
+
+			if safeIP == nil {
+				return nil, fmt.Errorf("no safe IP address resolved for host %q", host)
+			}
+
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, network, net.JoinHostPort(safeIP.IP.String(), port))
+		},
+	}
+
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Prohibit following redirects on webhook delivery to prevent open-redirect SSRF
+			return errors.New("webhook delivery does not follow HTTP redirects (mitigate redirect SSRF)")
+		},
+	}
+}
+
 // NewWebhookEngine initializes the asynchronous webhook delivery engine.
 func NewWebhookEngine(cfg WebhookConfig, metrics *MetricsCollector) *WebhookEngine {
 	if cfg.MaxRetries <= 0 {
@@ -241,13 +307,10 @@ func NewWebhookEngine(cfg WebhookConfig, metrics *MetricsCollector) *WebhookEngi
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{
-			Timeout: cfg.HTTPTimeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 20,
-				IdleConnTimeout:     90 * time.Second,
-			},
+		httpClient = NewSafeWebhookClient(cfg.HTTPTimeout)
+	} else if httpClient.CheckRedirect == nil {
+		httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return errors.New("webhook delivery does not follow HTTP redirects (mitigate redirect SSRF)")
 		}
 	}
 
@@ -387,6 +450,22 @@ func (e *WebhookEngine) DeleteSubscription(tenantID, id string) error {
 		e.metrics.SetWebhookActiveSubscriptions(count)
 	}
 	return nil
+}
+
+// RotateSecret rotates the HMAC signing secret of an existing webhook subscription.
+func (e *WebhookEngine) RotateSecret(tenantID, id string) (string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	sub, exists := e.subscriptions[id]
+	if !exists || (tenantID != "" && tenantID != "*" && sub.TenantID != tenantID) {
+		return "", ErrWebhookSubNotFound
+	}
+
+	newSecret := "whsec_" + randomHex(24)
+	sub.Secret = newSecret
+	sub.UpdatedAt = time.Now().UTC()
+	return newSecret, nil
 }
 
 // ActiveSubscriptionsCount returns the total number of active subscriptions.

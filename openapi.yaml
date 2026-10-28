@@ -48,6 +48,13 @@ paths:
                   time:
                     type: string
                     format: date-time
+        "400":
+          description: Bad Request
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+      operationId: getReady
 
   /live:
     get:
@@ -57,6 +64,13 @@ paths:
       responses:
         '200':
           description: Process is alive
+        "400":
+          description: Bad Request
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+      operationId: getLive
 
   /metrics:
     get:
@@ -78,11 +92,19 @@ paths:
                   # HELP aeitron_api_requests_total Total number of HTTP requests processed by the API gateway
                   # TYPE aeitron_api_requests_total counter
                   aeitron_api_requests_total{method="GET",route="/v1/catalog",status="200"} 42
+        "400":
+          description: Bad Request
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+      operationId: getMetrics
 
   /v1/gateway/stats:
     get:
       summary: Retrieve Real-Time Gateway Statistics
-      description: Returns live telemetry, uptime, rate limited counts, and status code distributions.
+      description: Returns live telemetry, uptime, rate limited counts, and status
+        code distributions.
       responses:
         '200':
           description: Gateway statistics
@@ -90,11 +112,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GatewayStats'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1GatewayStats
+      parameters: []
 
   /v1/gateway/routes:
     get:
       summary: List Registered Routing Rules
-      description: Returns the active reverse proxy table, timeout configurations, and upstream endpoints.
+      description: Returns the active reverse proxy table, timeout configurations, and
+        upstream endpoints.
       responses:
         '200':
           description: Active route table
@@ -107,6 +140,20 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/RouteRule'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "304":
+          $ref: "#/components/responses/NotModifiedResponse"
+      operationId: getV1GatewayRoutes
+      parameters:
+        - $ref: "#/components/parameters/IfNoneMatchHeader"
+        - $ref: "#/components/parameters/AcceptEncodingHeader"
 
   /v1/gateway/upstreams:
     get:
@@ -125,6 +172,16 @@ paths:
                 properties:
                   upstreams:
                     type: object
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1GatewayUpstreams
+      parameters: []
 
   /v1/gateway/cluster:
     get:
@@ -155,6 +212,16 @@ paths:
                   redis_addr:
                     type: string
                     example: 127.0.0.1:6379
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1GatewayCluster
+      parameters: []
 
   /v1/gateway/traces:
     get:
@@ -197,6 +264,15 @@ paths:
                       $ref: '#/components/schemas/TraceContext'
                   stats:
                     $ref: '#/components/schemas/TracingStats'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1GatewayTraces
 
   /v1/gateway/traces/slow:
     get:
@@ -228,11 +304,21 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/TraceContext'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1GatewayTracesSlow
 
   /v1/gateway/traces/stats:
     get:
       summary: Distributed Tracing Ring Buffer Stats
-      description: Returns buffer utilization, captured trace count, capacity, and active sampling rate.
+      description: Returns buffer utilization, captured trace count, capacity, and
+        active sampling rate.
       responses:
         '200':
           description: Tracing engine operational metrics
@@ -240,11 +326,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TracingStats'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1GatewayTracesStats
+      parameters: []
 
   /v1/gateway/traces/config:
     post:
       summary: Dynamic Tracing Configuration
-      description: Dynamically tunes trace sampling probability (0.0 to 1.0) and slow threshold without restarts.
+      description: Dynamically tunes trace sampling probability (0.0 to 1.0) and slow
+        threshold without restarts.
       requestBody:
         required: true
         content:
@@ -273,11 +370,25 @@ paths:
                     type: string
                   stats:
                     $ref: '#/components/schemas/TracingStats'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1GatewayTracesConfig
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/gateway/traces/{trace_id}:
     get:
       summary: Detailed Trace with Full Span Hierarchy
-      description: Retrieves complete microsecond span timeline for a trace (Ingress -> RateLimit -> Auth -> Cache -> Upstream -> Egress).
+      description: Retrieves complete microsecond span timeline for a trace (Ingress
+        -> RateLimit -> Auth -> Cache -> Upstream -> Egress).
       parameters:
         - name: trace_id
           in: path
@@ -287,13 +398,23 @@ paths:
             example: 4bf92f3577b34da6a3ce929d0e0e4736
       responses:
         '200':
-          description: Trace detail with all spans, microsecond timings, attributes, and events
+          description: Trace detail with all spans, microsecond timings, attributes, and
+            events
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/TraceContext'
         '404':
           $ref: '#/components/responses/NotFoundError'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1GatewayTracesByTraceId
 
   /v1/gateway/traces/{trace_id}/export:
     get:
@@ -312,7 +433,7 @@ paths:
           in: query
           schema:
             type: string
-            enum: [otlp, jaeger, zipkin]
+            enum: [ otlp, jaeger, zipkin ]
             default: otlp
       responses:
         '200':
@@ -323,11 +444,21 @@ paths:
                 type: object
         '404':
           $ref: '#/components/responses/NotFoundError'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1GatewayTracesByTraceIdExport
 
   /v1/auth/token:
     post:
       summary: Fast API-Key Token Exchange or JWT Issuance
-      description: Authenticates credentials or exchanges an API key for a signed HMAC-SHA256 JWT access token.
+      description: Authenticates credentials or exchanges an API key for a signed
+        HMAC-SHA256 JWT access token.
       security: []
       requestBody:
         required: true
@@ -352,11 +483,25 @@ paths:
                 $ref: '#/components/schemas/TokenResponse'
         '401':
           $ref: '#/components/responses/UnauthorizedError'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1AuthToken
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+        - $ref: "#/components/parameters/AeitronVersionHeader"
+        - $ref: "#/components/parameters/LivemodeHeader"
 
   /v1/sandbox/state:
     get:
       summary: Inspect Sandboxed Test Infrastructure State
-      description: Returns all mock orders, microVMs, DNS zones, and buckets created within the tenant's isolated sandbox.
+      description: Returns all mock orders, microVMs, DNS zones, and buckets created
+        within the tenant's isolated sandbox.
       responses:
         '200':
           description: Active sandbox fixtures
@@ -372,11 +517,22 @@ paths:
                     type: string
                   state:
                     type: object
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1SandboxState
+      parameters: []
 
   /v1/sandbox/reset:
     post:
       summary: Reset Sandboxed Environment
-      description: Clears all mock infrastructure fixtures, test orders, and simulated resources for the tenant.
+      description: Clears all mock infrastructure fixtures, test orders, and simulated
+        resources for the tenant.
       responses:
         '200':
           description: Sandbox successfully reset
@@ -391,11 +547,25 @@ paths:
                   livemode:
                     type: boolean
                     example: false
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1SandboxReset
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/sandbox/config:
     get:
       summary: Get Sandbox Simulation Configuration
-      description: Returns test card numbers, simulated boot latency, and mock IP subnets for development testing.
+      description: Returns test card numbers, simulated boot latency, and mock IP
+        subnets for development testing.
       responses:
         '200':
           description: Sandbox mock environment configuration
@@ -414,6 +584,16 @@ paths:
                   test_network_range:
                     type: string
                     example: 198.51.100.0/24 (RFC 5737 Test-Net)
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1SandboxConfig
+      parameters: []
 
   /v1/webhooks/subscriptions:
     post:
@@ -427,7 +607,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [url]
+              required: [ url ]
               properties:
                 url:
                   type: string
@@ -437,7 +617,7 @@ paths:
                   type: array
                   items:
                     type: string
-                  example: ["deployment.*", "invoice.paid", "ddos.detected"]
+                  example: [ "deployment.*", "invoice.paid", "ddos.detected" ]
                 secret:
                   type: string
                   description: Optional custom signing secret (auto-generated if omitted)
@@ -457,10 +637,22 @@ paths:
                     $ref: '#/components/schemas/WebhookSubscription'
         '400':
           $ref: '#/components/responses/BadRequestError'
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1WebhooksSubscriptions
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
     get:
       summary: List Webhook Subscriptions
-      description: Returns all active and inactive webhook subscriptions for the authenticated tenant.
+      description: Returns all active and inactive webhook subscriptions for the
+        authenticated tenant.
       responses:
         '200':
           description: List of registered webhook subscriptions
@@ -475,6 +667,16 @@ paths:
                       $ref: '#/components/schemas/WebhookSubscription'
                   count:
                     type: integer
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1WebhooksSubscriptions
+      parameters: []
 
   /v1/webhooks/subscriptions/{id}:
     get:
@@ -499,6 +701,15 @@ paths:
                     $ref: '#/components/schemas/WebhookSubscription'
         '404':
           $ref: '#/components/responses/NotFoundError'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1WebhooksSubscriptionsById
 
     delete:
       summary: Delete Webhook Subscription
@@ -526,6 +737,15 @@ paths:
                     example: sub_a1b2c3d4e5f6
         '404':
           $ref: '#/components/responses/NotFoundError'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: deleteV1WebhooksSubscriptionsById
 
   /v1/webhooks/dispatch:
     post:
@@ -539,7 +759,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [type]
+              required: [ type ]
               properties:
                 id:
                   type: string
@@ -577,11 +797,23 @@ paths:
                       $ref: '#/components/schemas/WebhookDelivery'
         '400':
           $ref: '#/components/responses/BadRequestError'
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1WebhooksDispatch
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/webhooks/deliveries:
     get:
       summary: List Recent Webhook Deliveries
-      description: Returns recent webhook delivery attempts, status codes, latencies, and retry statuses.
+      description: Returns recent webhook delivery attempts, status codes, latencies,
+        and retry statuses.
       responses:
         '200':
           description: List of webhook deliveries
@@ -596,11 +828,22 @@ paths:
                       $ref: '#/components/schemas/WebhookDelivery'
                   count:
                     type: integer
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1WebhooksDeliveries
+      parameters: []
 
   /v1/webhooks/dead-letter:
     get:
       summary: List Dead-Letter Queue (DLQ) Items
-      description: Returns deliveries that permanently failed all exponential backoff retry attempts.
+      description: Returns deliveries that permanently failed all exponential backoff
+        retry attempts.
       responses:
         '200':
           description: Failed deliveries in Dead-Letter Queue
@@ -615,18 +858,29 @@ paths:
                       $ref: '#/components/schemas/DeadLetterItem'
                   count:
                     type: integer
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1WebhooksDeadletter
+      parameters: []
 
   /v1/webhooks/dead-letter/retry:
     post:
       summary: Manually Redeliver Failed Webhook from DLQ
-      description: Resets attempt count and immediately re-enqueues a dead-letter item for delivery.
+      description: Resets attempt count and immediately re-enqueues a dead-letter item
+        for delivery.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [delivery_id]
+              required: [ delivery_id ]
               properties:
                 delivery_id:
                   type: string
@@ -646,6 +900,19 @@ paths:
                     $ref: '#/components/schemas/WebhookDelivery'
         '404':
           $ref: '#/components/responses/NotFoundError'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1WebhooksDeadletterRetry
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/webhooks/test:
     post:
@@ -668,6 +935,17 @@ paths:
                 $ref: '#/components/schemas/TestDeliveryResult'
         '400':
           $ref: '#/components/responses/BadRequestError'
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1WebhooksTest
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/webhooks/portal:
     get:
@@ -683,6 +961,16 @@ paths:
             text/html:
               schema:
                 type: string
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1WebhooksPortal
+      parameters: []
 
   /v1/events/stream:
     get:
@@ -694,7 +982,8 @@ paths:
       parameters:
         - name: topics
           in: query
-          description: Comma-separated list of topics or wildcards (e.g. `compute.*,dns.health`)
+          description: Comma-separated list of topics or wildcards (e.g.
+            `compute.*,dns.health`)
           required: false
           schema:
             type: string
@@ -722,6 +1011,15 @@ paths:
                   id: evt_123456
                   event: compute.instances
                   data: {"instance_id": "vm-99824", "status": "running"}
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1EventsStream
 
   /v1/events/publish:
     post:
@@ -757,11 +1055,23 @@ paths:
                     format: date-time
         '400':
           $ref: '#/components/responses/BadRequestError'
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1EventsPublish
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/events/history:
     get:
       summary: Query Recent Event Ring Buffer History
-      description: Retrieves recent infrastructure events from the high-performance memory ring buffer.
+      description: Retrieves recent infrastructure events from the high-performance
+        memory ring buffer.
       parameters:
         - name: topic
           in: query
@@ -792,18 +1102,32 @@ paths:
                       $ref: '#/components/schemas/InfrastructureEvent'
                   count:
                     type: integer
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1EventsHistory
 
   /v1/catalog:
     get:
       summary: List Product Catalog & Base Pricing
-      description: Returns all active platform products (Compute, Domains, Hosting, Storage, Databases) with server-authoritative rates.
+      description: Returns all active platform products (Compute, Domains, Hosting,
+        Storage, Databases) with server-authoritative rates.
       security: []
       parameters:
         - name: type
           in: query
           schema:
             type: string
-            enum: [domain, hosting, vps, database, storage]
+            enum: [ domain, hosting, vps, database, storage ]
+        - $ref: "#/components/parameters/AeitronVersionHeader"
+        - $ref: "#/components/parameters/LivemodeHeader"
+        - $ref: "#/components/parameters/IfNoneMatchHeader"
+        - $ref: "#/components/parameters/AcceptEncodingHeader"
       responses:
         '200':
           description: Product catalog listing
@@ -818,11 +1142,23 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/Product'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "304":
+          $ref: "#/components/responses/NotModifiedResponse"
+      operationId: getV1Catalog
 
   /v1/catalog/calculate:
     post:
       summary: Calculate Server-Authoritative Quote
-      description: Computes exact monetary quote with tax and volume discounts. Client prices are never trusted.
+      description: Computes exact monetary quote with tax and volume discounts. Client
+        prices are never trusted.
       security: []
       requestBody:
         required: true
@@ -830,13 +1166,13 @@ paths:
           application/json:
             schema:
               type: object
-              required: [items]
+              required: [ items ]
               properties:
                 items:
                   type: array
                   items:
                     type: object
-                    required: [priceId, quantity]
+                    required: [ priceId, quantity ]
                     properties:
                       priceId:
                         type: string
@@ -845,7 +1181,7 @@ paths:
                         minimum: 1
                 currency:
                   type: string
-                  enum: [USD, BDT]
+                  enum: [ USD, BDT ]
                   default: USD
                 discountCode:
                   type: string
@@ -856,24 +1192,40 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/QuoteCalculation'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1CatalogCalculate
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+        - $ref: "#/components/parameters/AeitronVersionHeader"
+        - $ref: "#/components/parameters/LivemodeHeader"
 
   /v1/orders:
     post:
       summary: Create Order (Server-Authoritative Checkout)
-      description: Places an order against server-verified prices. Triggers transactional outbox provisioning workflow.
+      description: Places an order against server-verified prices. Triggers
+        transactional outbox provisioning workflow.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [items]
+              required: [ items ]
               properties:
                 items:
                   type: array
                   items:
                     type: object
-                    required: [priceId, quantity]
+                    required: [ priceId, quantity ]
                     properties:
                       priceId:
                         type: string
@@ -881,7 +1233,7 @@ paths:
                         type: integer
                 currency:
                   type: string
-                  enum: [USD, BDT]
+                  enum: [ USD, BDT ]
                 idempotencyKey:
                   type: string
       responses:
@@ -891,6 +1243,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Order'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1Orders
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/orders/{order_id}:
     get:
@@ -908,6 +1273,15 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Order'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1OrdersByOrderId
 
   /v1/invoices:
     get:
@@ -916,11 +1290,22 @@ paths:
       responses:
         '200':
           description: List of invoices
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1Invoices
+      parameters: []
 
   /v1/domains/search:
     get:
       summary: Multi-TLD Domain Search & Suggestions
-      description: Queries RDAP and registrar cache for multi-TLD availability and smart suggestions.
+      description: Queries RDAP and registrar cache for multi-TLD availability and
+        smart suggestions.
       security: []
       parameters:
         - name: query
@@ -936,11 +1321,21 @@ paths:
       responses:
         '200':
           description: Search results
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1DomainsSearch
 
   /v1/domains/check:
     get:
       summary: Authoritative Domain Availability Check
-      description: Checks syntax, authoritative registrar availability, and real-time premium pricing.
+      description: Checks syntax, authoritative registrar availability, and real-time
+        premium pricing.
       security: []
       parameters:
         - name: domain
@@ -952,10 +1347,19 @@ paths:
           in: query
           schema:
             type: string
-            enum: [USD, BDT]
+            enum: [ USD, BDT ]
       responses:
         '200':
           description: Domain availability result
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1DomainsCheck
 
   /v1/domains/register:
     post:
@@ -967,7 +1371,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [domain, years]
+              required: [ domain, years ]
               properties:
                 domain:
                   type: string
@@ -978,6 +1382,19 @@ paths:
       responses:
         '202':
           description: Domain registration initiated
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1DomainsRegister
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/dns/zones:
     get:
@@ -985,6 +1402,16 @@ paths:
       responses:
         '200':
           description: List of DNS zones
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1DnsZones
+      parameters: []
     post:
       summary: Create DNS Zone
       requestBody:
@@ -993,13 +1420,26 @@ paths:
           application/json:
             schema:
               type: object
-              required: [domain]
+              required: [ domain ]
               properties:
                 domain:
                   type: string
       responses:
         '201':
           description: Zone created
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1DnsZones
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/dns/zones/{zone_id}/records:
     get:
@@ -1013,6 +1453,15 @@ paths:
       responses:
         '200':
           description: DNS records
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1DnsZonesByZoneIdRecords
     post:
       summary: Create or Update DNS Record
       parameters:
@@ -1021,17 +1470,18 @@ paths:
           required: true
           schema:
             type: string
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [type, name, content, ttl]
+              required: [ type, name, content, ttl ]
               properties:
                 type:
                   type: string
-                  enum: [A, AAAA, CNAME, MX, TXT, NS, SRV, CAA]
+                  enum: [ A, AAAA, CNAME, MX, TXT, NS, SRV, CAA ]
                 name:
                   type: string
                 content:
@@ -1042,6 +1492,17 @@ paths:
       responses:
         '201':
           description: DNS record published
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1DnsZonesByZoneIdRecords
 
   /v1/hosting/accounts:
     get:
@@ -1049,25 +1510,49 @@ paths:
       responses:
         '200':
           description: Hosting accounts
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1HostingAccounts
+      parameters: []
     post:
       summary: Provision Web Hosting Account
-      description: Sets up shared hosting, WordPress, or WooCommerce with cPanel/CyberPanel isolation.
+      description: Sets up shared hosting, WordPress, or WooCommerce with
+        cPanel/CyberPanel isolation.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [domain, plan]
+              required: [ domain, plan ]
               properties:
                 domain:
                   type: string
                 plan:
                   type: string
-                  enum: [shared-starter, managed-wordpress, woocommerce-scale]
+                  enum: [ shared-starter, managed-wordpress, woocommerce-scale ]
       responses:
         '201':
           description: Hosting account provisioned
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1HostingAccounts
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/compute/instances:
     get:
@@ -1075,6 +1560,16 @@ paths:
       responses:
         '200':
           description: List of compute instances
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1ComputeInstances
+      parameters: []
     post:
       summary: Provision VPS or GPU Compute Instance
       requestBody:
@@ -1083,7 +1578,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [name, plan, region, os_image]
+              required: [ name, plan, region, os_image ]
               properties:
                 name:
                   type: string
@@ -1098,6 +1593,19 @@ paths:
       responses:
         '202':
           description: Instance provisioning queued
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1ComputeInstances
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/compute/instances/{instance_id}/reboot:
     post:
@@ -1108,9 +1616,21 @@ paths:
           required: true
           schema:
             type: string
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
       responses:
         '202':
           description: Reboot signal sent
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1ComputeInstancesByInstanceIdReboot
 
   /v1/compute/instances/{instance_id}:
     delete:
@@ -1124,6 +1644,15 @@ paths:
       responses:
         '202':
           description: Termination initiated
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: deleteV1ComputeInstancesByInstanceId
 
   /v1/databases/instances:
     get:
@@ -1137,6 +1666,16 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/DatabaseInstance'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1DatabasesInstances
+      parameters: []
     post:
       summary: Provision a New Sovereign Database
       requestBody:
@@ -1152,6 +1691,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DatabaseInstance'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1DatabasesInstances
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/databases/instances/{instance_id}/pitr/restore:
     post:
@@ -1162,13 +1714,14 @@ paths:
           required: true
           schema:
             type: string
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [target_timestamp]
+              required: [ target_timestamp ]
               properties:
                 target_timestamp:
                   type: string
@@ -1176,6 +1729,17 @@ paths:
       responses:
         '202':
           description: PITR recovery started
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1DatabasesInstancesByInstanceIdPitrRestore
 
   /v1/usage/events:
     post:
@@ -1186,13 +1750,13 @@ paths:
           application/json:
             schema:
               type: object
-              required: [events]
+              required: [ events ]
               properties:
                 events:
                   type: array
                   items:
                     type: object
-                    required: [event_id, tenant_id, metric, value]
+                    required: [ event_id, tenant_id, metric, value ]
                     properties:
                       event_id:
                         type: string
@@ -1205,6 +1769,19 @@ paths:
       responses:
         '202':
           description: Telemetry events accepted for sliding window aggregation
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1UsageEvents
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/usage/tenant/{tenant_id}/current:
     get:
@@ -1218,6 +1795,15 @@ paths:
       responses:
         '200':
           description: Real-time tenant usage snapshot
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1UsageTenantByTenantIdCurrent
 
   /v1/notifications/dispatch:
     post:
@@ -1228,7 +1814,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [tenant_id, type, severity, title, message]
+              required: [ tenant_id, type, severity, title, message ]
               properties:
                 tenant_id:
                   type: string
@@ -1236,7 +1822,7 @@ paths:
                   type: string
                 severity:
                   type: string
-                  enum: [info, warning, error, critical]
+                  enum: [ info, warning, error, critical ]
                 title:
                   type: string
                 message:
@@ -1244,6 +1830,19 @@ paths:
       responses:
         '202':
           description: Notification event accepted
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1NotificationsDispatch
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/notifications/subscriptions:
     post:
@@ -1254,13 +1853,13 @@ paths:
           application/json:
             schema:
               type: object
-              required: [tenant_id, channel, target]
+              required: [ tenant_id, channel, target ]
               properties:
                 tenant_id:
                   type: string
                 channel:
                   type: string
-                  enum: [webhook, email, sms, slack, discord, pagerduty]
+                  enum: [ webhook, email, sms, slack, discord, pagerduty ]
                 target:
                   type: string
                 secret:
@@ -1268,6 +1867,19 @@ paths:
       responses:
         '201':
           description: Subscription created
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1NotificationsSubscriptions
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/notifications/dlq:
     get:
@@ -1275,6 +1887,16 @@ paths:
       responses:
         '200':
           description: Dead-letter queue records
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1NotificationsDlq
+      parameters: []
 
   /v1/fleet/nodes:
     get:
@@ -1282,6 +1904,16 @@ paths:
       responses:
         '200':
           description: Edge node inventory
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1FleetNodes
+      parameters: []
 
   /v1/fleet/canary/deploy:
     post:
@@ -1292,7 +1924,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [version, initial_percentage]
+              required: [ version, initial_percentage ]
               properties:
                 version:
                   type: string
@@ -1301,6 +1933,19 @@ paths:
       responses:
         '202':
           description: Canary rollout initiated
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+      operationId: postV1FleetCanaryDeploy
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
 
   /v1/audit/records:
     get:
@@ -1308,6 +1953,63 @@ paths:
       responses:
         '200':
           description: Audit ledger records
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+      operationId: getV1AuditRecords
+      parameters: []
+  /v1/webhooks/subscriptions/{id}/rotate-secret:
+    post:
+      operationId: rotateWebhookSubscriptionSecret
+      summary: Rotate Webhook Subscription Secret
+      description: Generates and assigns a new cryptographically secure HMAC-SHA256
+        signing secret for the specified webhook subscription.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Webhook subscription ID
+          schema:
+            type: string
+            example: sub_01h7x89ab12cd34ef56gh78jk
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+      responses:
+        "200":
+          description: Secret rotated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: rotated
+                  id:
+                    type: string
+                    example: sub_01h7x89ab12cd34ef56gh78jk
+                  secret:
+                    type: string
+                    example: whsec_d4f8a19b3c2e5a7d8e9f0123456789ab
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
 
 components:
   securitySchemes:
@@ -1424,13 +2126,13 @@ components:
 
     CreateDatabaseRequest:
       type: object
-      required: [name, engine, region]
+      required: [ name, engine, region ]
       properties:
         name:
           type: string
         engine:
           type: string
-          enum: [postgresql-16, timescaledb]
+          enum: [ postgresql-16, timescaledb ]
         region:
           type: string
         storage_gb:
@@ -1439,7 +2141,7 @@ components:
 
     ProblemDetails:
       type: object
-      required: [type, title, status, detail]
+      required: [ type, title, status, detail ]
       properties:
         type:
           type: string
@@ -1475,7 +2177,7 @@ components:
           type: array
           items:
             type: string
-          example: ["deployment.*", "invoice.paid"]
+          example: [ "deployment.*", "invoice.paid" ]
         secret:
           type: string
           example: whsec_0123456789abcdef0123456789abcdef
@@ -1521,7 +2223,7 @@ components:
           example: 200
         status:
           type: string
-          enum: [pending, success, retrying, dead_letter]
+          enum: [ pending, success, retrying, dead_letter ]
           example: success
         duration_ms:
           type: integer
@@ -1548,7 +2250,7 @@ components:
 
     TestWebhookRequest:
       type: object
-      required: [url]
+      required: [ url ]
       properties:
         url:
           type: string
@@ -1596,7 +2298,7 @@ components:
 
     InfrastructureEvent:
       type: object
-      required: [topic, type]
+      required: [ topic, type ]
       properties:
         id:
           type: string
@@ -1672,7 +2374,7 @@ components:
           example: gateway.upstream
         kind:
           type: string
-          enum: [SERVER, CLIENT, INTERNAL]
+          enum: [ SERVER, CLIENT, INTERNAL ]
         duration_micros:
           type: integer
           example: 4500
@@ -1747,7 +2449,8 @@ components:
             $ref: '#/components/schemas/ProblemDetails'
 
     NotModifiedResponse:
-      description: RFC 9111 resource has not been modified since the specified ETag (saves network bandwidth)
+      description: RFC 9111 resource has not been modified since the specified ETag
+        (saves network bandwidth)
       headers:
         ETag:
           schema:

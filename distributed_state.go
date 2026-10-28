@@ -569,10 +569,15 @@ func (r *RedisStateAdapter) Set(ctx context.Context, key string, val []byte, ttl
 }
 
 func (r *RedisStateAdapter) Delete(ctx context.Context, key string) error {
-	_ = r.fallback.Delete(ctx, key)
+	if !r.cfg.FailClosed {
+		_ = r.fallback.Delete(ctx, key)
+	}
 
 	conn, err := r.getConn(ctx)
 	if err != nil {
+		if r.cfg.FailClosed {
+			return fmt.Errorf("%w: failed to connect to redis", ErrClusterUnavailable)
+		}
 		return nil
 	}
 
@@ -580,38 +585,55 @@ func (r *RedisStateAdapter) Delete(ctx context.Context, key string) error {
 	err = writeRESPCommand(conn.writer, "DEL", key)
 	if err != nil {
 		r.putConn(conn, err)
+		if r.cfg.FailClosed {
+			return fmt.Errorf("%w: failed to delete redis key", ErrClusterUnavailable)
+		}
 		return nil
 	}
 	_, readErr := readRESPReply(conn.reader)
 	r.putConn(conn, readErr)
+	if readErr != nil && r.cfg.FailClosed {
+		return fmt.Errorf("%w: failed to read delete reply", ErrClusterUnavailable)
+	}
 	return nil
 }
 
 func (r *RedisStateAdapter) DeletePrefix(ctx context.Context, prefix string) (int, error) {
-	localCount, _ := r.fallback.DeletePrefix(ctx, prefix)
+	if !r.cfg.FailClosed {
+		_, _ = r.fallback.DeletePrefix(ctx, prefix)
+	}
 
 	conn, err := r.getConn(ctx)
 	if err != nil {
-		return localCount, nil
+		if r.cfg.FailClosed {
+			return 0, fmt.Errorf("%w: failed to connect to redis", ErrClusterUnavailable)
+		}
+		return r.fallback.DeletePrefix(ctx, prefix)
 	}
 
 	_ = conn.netConn.SetDeadline(time.Now().Add(r.cfg.ReadTimeout))
 	err = writeRESPCommand(conn.writer, "KEYS", prefix+"*")
 	if err != nil {
 		r.putConn(conn, err)
-		return localCount, nil
+		if r.cfg.FailClosed {
+			return 0, fmt.Errorf("%w: failed to query keys in redis", ErrClusterUnavailable)
+		}
+		return r.fallback.DeletePrefix(ctx, prefix)
 	}
 
 	reply, readErr := readRESPReply(conn.reader)
 	if readErr != nil || reply == nil {
 		r.putConn(conn, readErr)
-		return localCount, nil
+		if r.cfg.FailClosed {
+			return 0, fmt.Errorf("%w: failed to read keys reply", ErrClusterUnavailable)
+		}
+		return r.fallback.DeletePrefix(ctx, prefix)
 	}
 
 	keysList, ok := reply.([]interface{})
 	if !ok || len(keysList) == 0 {
 		r.putConn(conn, nil)
-		return localCount, nil
+		return 0, nil
 	}
 
 	delArgs := make([]string, 0, len(keysList)+1)
@@ -622,13 +644,31 @@ func (r *RedisStateAdapter) DeletePrefix(ctx context.Context, prefix string) (in
 		}
 	}
 
+	deletedCount := 0
 	if len(delArgs) > 1 {
-		_ = writeRESPCommand(conn.writer, delArgs...)
-		_, _ = readRESPReply(conn.reader)
+		delCmdErr := writeRESPCommand(conn.writer, delArgs...)
+		if delCmdErr != nil {
+			r.putConn(conn, delCmdErr)
+			if r.cfg.FailClosed {
+				return 0, fmt.Errorf("%w: failed to execute del command in redis", ErrClusterUnavailable)
+			}
+			return r.fallback.DeletePrefix(ctx, prefix)
+		}
+		delReply, delReadErr := readRESPReply(conn.reader)
+		r.putConn(conn, delReadErr)
+		if delReadErr != nil && r.cfg.FailClosed {
+			return 0, fmt.Errorf("%w: failed to read del reply", ErrClusterUnavailable)
+		}
+		if n, isInt := delReply.(int64); isInt {
+			deletedCount = int(n)
+		} else {
+			deletedCount = len(delArgs) - 1
+		}
+	} else {
+		r.putConn(conn, nil)
 	}
-	r.putConn(conn, nil)
 
-	return len(delArgs) - 1, nil
+	return deletedCount, nil
 }
 
 // RateLimitAllow atomically calculates token bucket replenishment via Redis or transparently falls back.
@@ -775,12 +815,18 @@ func (r *RedisStateAdapter) IdempotencyAcquire(ctx context.Context, key string, 
 	cmdErr = writeRESPCommand(conn.writer, "GET", redisKey)
 	if cmdErr != nil {
 		r.putConn(conn, cmdErr)
+		if r.cfg.FailClosed {
+			return false, nil, fmt.Errorf("%w: failed to read existing idempotency record", ErrClusterUnavailable)
+		}
 		return r.fallback.IdempotencyAcquire(ctx, key, payloadHash, ttl)
 	}
 
 	getReply, getErr := readRESPReply(conn.reader)
 	r.putConn(conn, getErr)
 	if getErr != nil || getReply == nil {
+		if r.cfg.FailClosed {
+			return false, nil, fmt.Errorf("%w: failed to retrieve existing idempotency record reply", ErrClusterUnavailable)
+		}
 		return r.fallback.IdempotencyAcquire(ctx, key, payloadHash, ttl)
 	}
 
@@ -835,7 +881,9 @@ func (r *RedisStateAdapter) IdempotencyComplete(ctx context.Context, key string,
 
 // IdempotencyAbort releases the lock upon server errors.
 func (r *RedisStateAdapter) IdempotencyAbort(ctx context.Context, key string) error {
-	_ = r.fallback.IdempotencyAbort(ctx, key)
+	if !r.cfg.FailClosed {
+		_ = r.fallback.IdempotencyAbort(ctx, key)
+	}
 	return r.Delete(ctx, "aeitron:idemp:"+key)
 }
 

@@ -271,4 +271,218 @@ func TestSecurityRegression_RedisTLSAndFailClosed(t *testing.T) {
 	if idempErr == nil || !strings.Contains(idempErr.Error(), ErrClusterUnavailable.Error()) {
 		t.Fatalf("expected ErrClusterUnavailable on idempotency in fail-closed mode, got %v", idempErr)
 	}
+
+	// In fail-closed mode, Delete, DeletePrefix, and IdempotencyAbort must also fail closed
+	delErr := adapter.Delete(ctx, "some_key")
+	if delErr == nil || !strings.Contains(delErr.Error(), ErrClusterUnavailable.Error()) {
+		t.Fatalf("expected ErrClusterUnavailable on Delete in fail-closed mode, got %v", delErr)
+	}
+
+	_, delPrefErr := adapter.DeletePrefix(ctx, "some_prefix:")
+	if delPrefErr == nil || !strings.Contains(delPrefErr.Error(), ErrClusterUnavailable.Error()) {
+		t.Fatalf("expected ErrClusterUnavailable on DeletePrefix in fail-closed mode, got %v", delPrefErr)
+	}
+
+	abortErr := adapter.IdempotencyAbort(ctx, "some_idemp_key")
+	if abortErr == nil || !strings.Contains(abortErr.Error(), ErrClusterUnavailable.Error()) {
+		t.Fatalf("expected ErrClusterUnavailable on IdempotencyAbort in fail-closed mode, got %v", abortErr)
+	}
+}
+
+// TestSecurityRegression_WebhookRedirectSSRF verifies that webhook delivery rejects HTTP redirects
+// and does not follow them to internal or metadata IP addresses.
+func TestSecurityRegression_WebhookRedirectSSRF(t *testing.T) {
+	t.Setenv("AEITRON_DEV_MODE", "true")
+	// Destination server returning 302 redirect to cloud metadata IP
+	redirectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
+	}))
+	defer redirectServer.Close()
+
+	client := NewSafeWebhookClient(2 * time.Second)
+	req, err := http.NewRequest(http.MethodPost, redirectServer.URL, strings.NewReader(`{"test":true}`))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	_, err = client.Do(req)
+	if err == nil {
+		t.Fatalf("expected client to fail when following redirect, but it succeeded")
+	}
+	if !strings.Contains(err.Error(), "does not follow HTTP redirects") {
+		t.Fatalf("expected redirect error message, got %v", err)
+	}
+}
+
+// TestSecurityRegression_WebhooksAndEventsScopeDenial verifies that callers without granular
+// scopes receive 403 Forbidden on events and webhooks endpoints.
+func TestSecurityRegression_WebhooksAndEventsScopeDenial(t *testing.T) {
+	gw := NewAPIGateway("test-secret-32-bytes-security-scopes")
+	defer gw.Close()
+
+	// Token with only billing:read (lacks webhooks:* and events:*)
+	noScopeToken, err := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "user_limited",
+		TenantID: "tenant_scope_test",
+		Role:     "member",
+		Scopes:   []string{"billing:read"},
+		Exp:      time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("failed to generate token: %v", err)
+	}
+	authHeader := "Bearer " + noScopeToken
+
+	// 1. GET /v1/webhooks/subscriptions without webhooks:read -> 403 Forbidden
+	req := httptest.NewRequest(http.MethodGet, "/v1/webhooks/subscriptions", nil)
+	req.Header.Set("Authorization", authHeader)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for missing webhooks:read, got %d", rec.Code)
+	}
+
+	// 2. POST /v1/webhooks/subscriptions without webhooks:write -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodPost, "/v1/webhooks/subscriptions", strings.NewReader(`{"url":"https://example.com/hook","events":["order.created"]}`))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for missing webhooks:write, got %d", rec.Code)
+	}
+
+	// 3. GET /v1/events/history without events:read -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodGet, "/v1/events/history", nil)
+	req.Header.Set("Authorization", authHeader)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for missing events:read, got %d", rec.Code)
+	}
+
+	// 4. POST /v1/events/publish without events:write -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodPost, "/v1/events/publish", strings.NewReader(`{"topic":"orders","type":"order.created","data":{"id":"1"}}`))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for missing events:write, got %d", rec.Code)
+	}
+}
+
+// TestSecurityRegression_WebhookSecretMaskingAndRotation verifies secret redaction on GET
+// and secure rotation via POST /v1/webhooks/subscriptions/{id}/rotate-secret.
+func TestSecurityRegression_WebhookSecretMaskingAndRotation(t *testing.T) {
+	t.Setenv("AEITRON_DEV_MODE", "true")
+	mockReceiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mockReceiver.Close()
+
+	gw := NewAPIGateway("test-secret-32-bytes-security-masking")
+	defer gw.Close()
+
+	scopedToken, err := gw.Authenticator().GenerateSignedToken(JWTClaims{
+		Sub:      "user_dev",
+		TenantID: "tenant_masking_test",
+		Role:     "developer",
+		Scopes:   []string{"webhooks:read", "webhooks:write"},
+		Exp:      time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("failed to generate token: %v", err)
+	}
+	authHeader := "Bearer " + scopedToken
+
+	// 1. Create subscription -> returns unmasked secret once
+	createBody := `{"url":"` + mockReceiver.URL + `","events":["tenant.provisioned"]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks/subscriptions", strings.NewReader(createBody))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created on webhook create, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	var createResp struct {
+		Subscription WebhookSubscription `json:"subscription"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &createResp); err != nil {
+		t.Fatalf("failed to parse create response: %v", err)
+	}
+	createdSecret := createResp.Subscription.Secret
+	subID := createResp.Subscription.ID
+
+	if !strings.HasPrefix(createdSecret, "whsec_") || strings.Contains(createdSecret, "******") {
+		t.Fatalf("expected full unmasked secret on creation, got %s", createdSecret)
+	}
+
+	// 2. GET /v1/webhooks/subscriptions -> secret must be masked
+	req = httptest.NewRequest(http.MethodGet, "/v1/webhooks/subscriptions", nil)
+	req.Header.Set("Authorization", authHeader)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on list subscriptions, got %d", rec.Code)
+	}
+	var listResp struct {
+		Subscriptions []WebhookSubscription `json:"subscriptions"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("failed to parse list response: %v", err)
+	}
+	if len(listResp.Subscriptions) == 0 {
+		t.Fatalf("expected at least 1 subscription")
+	}
+	if listResp.Subscriptions[0].Secret != "whsec_****************" {
+		t.Fatalf("expected masked secret 'whsec_****************', got %s", listResp.Subscriptions[0].Secret)
+	}
+
+	// 3. GET /v1/webhooks/subscriptions/{id} -> secret must also be masked
+	req = httptest.NewRequest(http.MethodGet, "/v1/webhooks/subscriptions/"+subID, nil)
+	req.Header.Set("Authorization", authHeader)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on get subscription by id, got %d", rec.Code)
+	}
+	var getResp struct {
+		Subscription WebhookSubscription `json:"subscription"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &getResp); err != nil {
+		t.Fatalf("failed to parse get response: %v", err)
+	}
+	if getResp.Subscription.Secret != "whsec_****************" {
+		t.Fatalf("expected masked secret 'whsec_****************', got %s", getResp.Subscription.Secret)
+	}
+
+	// 4. Rotate secret via POST /v1/webhooks/subscriptions/{id}/rotate-secret
+	req = httptest.NewRequest(http.MethodPost, "/v1/webhooks/subscriptions/"+subID+"/rotate-secret", nil)
+	req.Header.Set("Authorization", authHeader)
+	rec = httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on rotate-secret, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+	var rotateResp struct {
+		Status string `json:"status"`
+		ID     string `json:"id"`
+		Secret string `json:"secret"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &rotateResp); err != nil {
+		t.Fatalf("failed to parse rotate response: %v", err)
+	}
+	if rotateResp.Status != "rotated" || rotateResp.ID != subID {
+		t.Fatalf("unexpected rotate response metadata: %+v", rotateResp)
+	}
+	if !strings.HasPrefix(rotateResp.Secret, "whsec_") || rotateResp.Secret == createdSecret {
+		t.Fatalf("expected new unmasked rotated secret distinct from original, got %s", rotateResp.Secret)
+	}
 }
